@@ -2,6 +2,7 @@
 #include "nereo_interfaces/msg/command_velocity.hpp"
 #include "sensor_msgs/msg/imu.hpp"
 #include "sensor_msgs/msg/fluid_pressure.hpp"
+#include "std_msgs/msg/float64_multi_array.hpp"
 #include <cmath>
 #include <array>
 #include <vector>
@@ -95,6 +96,16 @@ public:
         this->declare_parameter("ki", std::vector<double>{0.01, 0.01, 0.01, 0.01});
         this->declare_parameter("kd", std::vector<double>{0.05, 0.05, 0.05, 0.05});
         
+        // Manual setpoint parameters (per-axis)
+        this->declare_parameter("manual_setpoint_depth", false);
+        this->declare_parameter("manual_setpoint_roll", false);
+        this->declare_parameter("manual_setpoint_pitch", false);
+        this->declare_parameter("manual_setpoint_yaw", false);
+        this->declare_parameter("setpoint_depth", 0.0);
+        this->declare_parameter("setpoint_roll", 0.0);
+        this->declare_parameter("setpoint_pitch", 0.0);
+        this->declare_parameter("setpoint_yaw", 0.0);
+        
         // CS Controller parameters
         this->declare_parameter("cs_kx0", std::vector<double>{198.0952, 468.0585});
         this->declare_parameter("cs_kx1", std::vector<double>{3.8191, 6.0003});
@@ -110,6 +121,12 @@ public:
         // Initialize publishers and subscribers
         cmd_vel_pub_ = this->create_publisher<nereo_interfaces::msg::CommandVelocity>(
             "/nereo_cmd_vel", 10);
+            
+        setpoints_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
+            "/controller/setpoints", 10);
+            
+        errors_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
+            "/controller/errors", 10);
             
         cmd_vel_sub_ = this->create_subscription<nereo_interfaces::msg::CommandVelocity>(
             "/nereo_cmd_vel_no_fb", 10,
@@ -144,6 +161,8 @@ public:
 private:
     // Publishers and subscribers
     rclcpp::Publisher<nereo_interfaces::msg::CommandVelocity>::SharedPtr cmd_vel_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr setpoints_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr errors_pub_;
     rclcpp::Subscription<nereo_interfaces::msg::CommandVelocity>::SharedPtr cmd_vel_sub_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
     rclcpp::Subscription<sensor_msgs::msg::FluidPressure>::SharedPtr pressure_sub_;
@@ -166,6 +185,7 @@ private:
     std::array<float, 4> setpoints_ = {0.0f};
     std::array<uint8_t, 4> last_cmd_vel_neq_0_ = {1};
     bool first_update_ = true;
+    std::array<bool, 4> manual_setpoint_ = {false, false, false, false}; // depth, roll, pitch, yaw
     
     // Latest sensor data
     Eigen::Quaternionf current_orientation_ = Eigen::Quaternionf::Identity();
@@ -181,6 +201,26 @@ private:
         if (new_mode != control_mode_) {
             control_mode_ = new_mode;
             RCLCPP_INFO(this->get_logger(), "Control mode changed to: %d", mode);
+        }
+        
+        // Check per-axis manual setpoint modes
+        const std::array<std::string, 4> manual_keys = {"manual_setpoint_depth", "manual_setpoint_roll", "manual_setpoint_pitch", "manual_setpoint_yaw"};
+        const std::array<std::string, 4> sp_keys = {"setpoint_depth", "setpoint_roll", "setpoint_pitch", "setpoint_yaw"};
+        const std::array<std::string, 4> axis_names = {"Depth", "Roll", "Pitch", "Yaw"};
+        
+        for (size_t i = 0; i < 4; i++) {
+            bool new_manual = this->get_parameter(manual_keys[i]).as_bool();
+            if (new_manual != manual_setpoint_[i]) {
+                manual_setpoint_[i] = new_manual;
+                RCLCPP_INFO(this->get_logger(), "Manual setpoint %s: %s", axis_names[i].c_str(), new_manual ? "ENABLED" : "DISABLED");
+            }
+            if (manual_setpoint_[i]) {
+                float sp = static_cast<float>(this->get_parameter(sp_keys[i]).as_double());
+                if (setpoints_[i] != sp) {
+                    setpoints_[i] = sp;
+                    RCLCPP_INFO(this->get_logger(), "Manual setpoint %s updated: %.4f", axis_names[i].c_str(), sp);
+                }
+            }
         }
         
         // Check if PID parameters have changed
@@ -422,14 +462,57 @@ private:
         output_msg.cmd_vel[5] = output_cmd_vel[5];  // yaw
         
         cmd_vel_pub_->publish(output_msg);
+        
+        // Publish setpoints and errors for PlotJuggler
+        publishDebugData();
     }
     
-    void calculateRpyFromQuaternion(const Eigen::Quaternionf& quaternion, std::array<float, 3>& rpy) {
-        // Extract Euler angles from quaternion (roll, pitch, yaw)
-        Eigen::Vector3f euler = quaternion.toRotationMatrix().eulerAngles(0, 1, 2);
-        rpy[0] = euler.x(); // roll
-        rpy[1] = euler.y(); // pitch
-        rpy[2] = euler.z(); // yaw
+    void publishDebugData() {
+        // Compute current values
+        std::array<float, 3> rpy_rads;
+        calculateRpyFromQuaternion(current_orientation_, rpy_rads);
+        
+        std::array<double, 4> current_values = {
+            static_cast<double>(current_pressure_),
+            static_cast<double>(rpy_rads[0]),  // roll
+            static_cast<double>(rpy_rads[1]),  // pitch
+            static_cast<double>(rpy_rads[2])   // yaw
+        };
+        
+        // Publish setpoints: [depth, roll, pitch, yaw]
+        auto sp_msg = std_msgs::msg::Float64MultiArray();
+        sp_msg.data = {static_cast<double>(setpoints_[0]),
+                       static_cast<double>(setpoints_[1]),
+                       static_cast<double>(setpoints_[2]),
+                       static_cast<double>(setpoints_[3])};
+        setpoints_pub_->publish(sp_msg);
+        
+        // Publish errors: [depth_err, roll_err, pitch_err, yaw_err]
+        auto err_msg = std_msgs::msg::Float64MultiArray();
+        err_msg.data = {static_cast<double>(setpoints_[0]) - current_values[0],
+                        static_cast<double>(setpoints_[1]) - current_values[1],
+                        static_cast<double>(setpoints_[2]) - current_values[2],
+                        static_cast<double>(wrap_phase(setpoints_[3] - current_values[3]))};
+        errors_pub_->publish(err_msg);
+    }
+    
+    void calculateRpyFromQuaternion(const Eigen::Quaternionf& q, std::array<float, 3>& rpy) {
+        // Roll (x-axis rotation)
+        float sinr_cosp = 2.0f * (q.w() * q.x() + q.y() * q.z());
+        float cosr_cosp = 1.0f - 2.0f * (q.x() * q.x() + q.y() * q.y());
+        rpy[0] = std::atan2(sinr_cosp, cosr_cosp);
+
+        // Pitch (y-axis rotation)
+        float sinp = 2.0f * (q.w() * q.y() - q.z() * q.x());
+        if (std::abs(sinp) >= 1.0f)
+            rpy[1] = std::copysign(static_cast<float>(M_PI) / 2.0f, sinp);
+        else
+            rpy[1] = std::asin(sinp);
+
+        // Yaw (z-axis rotation)
+        float siny_cosp = 2.0f * (q.w() * q.z() + q.x() * q.y());
+        float cosy_cosp = 1.0f - 2.0f * (q.y() * q.y() + q.z() * q.z());
+        rpy[2] = std::atan2(siny_cosp, cosy_cosp);
     }
     
     uint8_t updateSetpoints(const std::array<float, 6>& cmd_vel) {
@@ -437,8 +520,9 @@ private:
         std::array<float, 3> rpy_rads;
         calculateRpyFromQuaternion(current_orientation_, rpy_rads);
         
-        // Updates setpoints for angles
+        // Updates setpoints for angles (skip axes with manual override)
         for (uint8_t i = 0; i < 3; i++) {
+            if (manual_setpoint_[i+1]) continue; // skip if manual
             if (std::abs(cmd_vel[i+3]) < TOLERANCE) {
                 if (last_cmd_vel_neq_0_[i+1]) {
                     setpoints_[i+1] = rpy_rads[i];
@@ -450,18 +534,20 @@ private:
             }
         }
         
-        // Updates depth setpoint
-        Eigen::Vector3f z_out(0.0f, 0.0f, 1.0f);
-        Eigen::Vector3f z_out_RBF = current_orientation_.inverse() * z_out;
-        
-        bool x_condition = std::abs(z_out_RBF.x()) < TOLERANCE || std::abs(cmd_vel[0]) < TOLERANCE;
-        bool y_condition = std::abs(z_out_RBF.y()) < TOLERANCE || std::abs(cmd_vel[1]) < TOLERANCE;
-        bool z_condition = std::abs(z_out_RBF.z()) < TOLERANCE || std::abs(cmd_vel[2]) < TOLERANCE;
-        
-        if (x_condition && y_condition && z_condition) {
-            if (last_cmd_vel_neq_0_[0]) {
-                setpoints_[0] = current_pressure_;
-                count++;
+        // Updates depth setpoint (skip if manual)
+        if (!manual_setpoint_[0]) {
+            Eigen::Vector3f z_out(0.0f, 0.0f, 1.0f);
+            Eigen::Vector3f z_out_RBF = current_orientation_.inverse() * z_out;
+            
+            bool x_condition = std::abs(z_out_RBF.x()) < TOLERANCE || std::abs(cmd_vel[0]) < TOLERANCE;
+            bool y_condition = std::abs(z_out_RBF.y()) < TOLERANCE || std::abs(cmd_vel[1]) < TOLERANCE;
+            bool z_condition = std::abs(z_out_RBF.z()) < TOLERANCE || std::abs(cmd_vel[2]) < TOLERANCE;
+            
+            if (x_condition && y_condition && z_condition) {
+                if (last_cmd_vel_neq_0_[0]) {
+                    setpoints_[0] = current_pressure_;
+                    count++;
+                }
             }
         }
 
@@ -482,10 +568,10 @@ private:
         }
         
         if (first_update_) {
-            setpoints_[0] = current_pressure_;
-            setpoints_[1] = rpy_rads[0];
-            setpoints_[2] = rpy_rads[1];
-            setpoints_[3] = rpy_rads[2];
+            if (!manual_setpoint_[0]) setpoints_[0] = current_pressure_;
+            if (!manual_setpoint_[1]) setpoints_[1] = rpy_rads[0];
+            if (!manual_setpoint_[2]) setpoints_[2] = rpy_rads[1];
+            if (!manual_setpoint_[3]) setpoints_[3] = rpy_rads[2];
             first_update_ = false;
         }
         
@@ -496,6 +582,12 @@ private:
         if (value > max) return max;
         if (value < min) return min;
         return value;
+    }
+
+    static float wrap_phase(float angle) {
+        while (angle > M_PI) angle -= 2 * M_PI;
+        while (angle < -M_PI) angle += 2 * M_PI;
+        return angle;
     }
     
     void calculateFeedbackWithPid(const std::array<float, 6>& cmd_vel, std::array<float, 6>& output_cmd_vel) {
@@ -515,9 +607,11 @@ private:
         output_cmd_vel = cmd_vel;
         
         // Calculate PID outputs
+        float yaw_error = setpoints_[3] - current_values[3];
+        yaw_error = wrap_phase(yaw_error);
         float roll_pid_feedback = pids_[1].compute(setpoints_[1] - current_values[1]);
         float pitch_pid_feedback = pids_[2].compute(setpoints_[2] - current_values[2]);
-        float yaw_pid_feedback = pids_[3].compute(setpoints_[3] - current_values[3]);
+        float yaw_pid_feedback = -pids_[3].compute(yaw_error);
         
         // Depth control
         float z_pid_output = pids_[0].compute(setpoints_[0] - current_values[0]);
