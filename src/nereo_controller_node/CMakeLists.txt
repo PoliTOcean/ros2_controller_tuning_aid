@@ -12,6 +12,7 @@ endif()
 
 # Find dependencies
 find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_python REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(nereo_interfaces REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -39,6 +40,11 @@ ament_target_dependencies(nereo_controller_node
 # Install executable
 install(TARGETS
   nereo_controller_node
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(PROGRAMS
+  scripts/pid_tuner_gui.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -11,6 +11,7 @@ This design allows you to work on and tune the controllers at runtime using ROS 
 - **Automatic setpoints**: maintains depth and orientation when no active commands are present
 - **Runtime parameters**: all controller parameters (PID and CS) can be changed via the ROS 2 parameter server without recompiling
 - **Dynamic tuning support**: controller gains and limits can be adjusted in real time
+- **Graphical tuner UI**: desktop interface to read/write all controller parameters directly
 
 ## Control Modes
 
@@ -37,6 +38,28 @@ This design allows you to work on and tune the controllers at runtime using ROS 
 2. **Publish test data** to `/barometer_pressure`, `/imu_data`, and `/nereo_cmd_vel_no_fb`
 3. **Change parameters** at runtime using `ros2 param set` for dynamic tuning
 4. **Monitor output** on `/nereo_cmd_vel`
+
+### PID Tuner GUI
+
+You can tune all available parameters with a graphical interface.
+
+- Launch controller + GUI together:
+
+```sh
+ros2 launch nereo_controller_node nereo_controller_with_gui.launch.py
+```
+
+- Or run GUI against an already-running node:
+
+```sh
+ros2 run nereo_controller_node pid_tuner_gui.py --ros-args -p target_node:=/nereo_controller_node
+```
+
+The GUI includes:
+- `control_mode` selector
+- `kp`, `ki`, `kd` arrays for depth/roll/pitch/yaw
+- manual setpoint toggles and values for depth/roll/pitch/yaw
+- full CS controller section: `cs_kx0/1/2`, `cs_ki0/1/2`, `cs_heave_min/max`, `cs_angle_min/max`
 
 ## Notes
 

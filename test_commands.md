@@ -13,6 +13,18 @@ Esempio:
 ros2 launch nereo_controller_node nereo_controller.launch.py control_mode:=3 cs_kx0:="[200.0, 470.0]" cs_ki0:=-360.0 cs_heave_min:=-70.0 cs_heave_max:=90.0
 ```
 
+### Launch Node + PID Tuner GUI
+
+```sh
+ros2 launch nereo_controller_node nereo_controller_with_gui.launch.py
+```
+
+Oppure, se il nodo e gia attivo:
+
+```sh
+ros2 run nereo_controller_node pid_tuner_gui.py --ros-args -p target_node:=/nereo_controller_node
+```
+
 ### Publish Test Messages
 
 - **Publish Pressure:**

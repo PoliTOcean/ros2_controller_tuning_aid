@@ -13,43 +13,43 @@ def generate_launch_description():
 
     kp_arg = DeclareLaunchArgument(
         'kp',
-        default_value='[0.1, 0.1, 0.1, 0.1]',
+        default_value='[0.0, 0.0, 0.0, 0.0]',
         description='Proportional gains for z, roll, pitch, yaw controllers'
     )
 
     ki_arg = DeclareLaunchArgument(
         'ki',
-        default_value='[0.01, 0.01, 0.01, 0.01]',
+        default_value='[0.0, 0.0, 0.0, 0.0]',
         description='Integral gains for z, roll, pitch, yaw controllers'
     )
 
     kd_arg = DeclareLaunchArgument(
         'kd',
-        default_value='[0.05, 0.05, 0.05, 0.05]',
+        default_value='[0.0, 0.0, 0.0, 0.0]',
         description='Derivative gains for z, roll, pitch, yaw controllers'
     )
 
     cs_kx0_arg = DeclareLaunchArgument(
         'cs_kx0',
-        default_value='[198.0952, 468.0585]',
+        default_value='[0.0, 0.0]',
         description='CS controller kx0 gains'
     )
 
     cs_kx1_arg = DeclareLaunchArgument(
         'cs_kx1',
-        default_value='[3.8191, 6.0003]',
+        default_value='[0.0, 0.0]',
         description='CS controller kx1 gains'
     )
 
     cs_kx2_arg = DeclareLaunchArgument(
         'cs_kx2',
-        default_value='[5.2577, 11.8206]',
+        default_value='[0.0, 0.0]',
         description='CS controller kx2 gains'
     )
 
     cs_ki0_arg = DeclareLaunchArgument(
         'cs_ki0',
-        default_value='-359.2481',
+        default_value='0.0',
         description='CS controller ki0 gain'
     )
 
@@ -61,31 +61,31 @@ def generate_launch_description():
 
     cs_ki2_arg = DeclareLaunchArgument(
         'cs_ki2',
-        default_value='-16.7389',
+        default_value='0.0',
         description='CS controller ki2 gain'
     )
 
     cs_heave_min_arg = DeclareLaunchArgument(
         'cs_heave_min',
-        default_value='-60.0',
+        default_value='0.0',
         description='CS controller heave minimum limit'
     )
 
     cs_heave_max_arg = DeclareLaunchArgument(
         'cs_heave_max',
-        default_value='80.0',
+        default_value='0.0',
         description='CS controller heave maximum limit'
     )
 
     cs_angle_min_arg = DeclareLaunchArgument(
         'cs_angle_min',
-        default_value='-30.0',
+        default_value='0.0',
         description='CS controller angle minimum limit'
     )
 
     cs_angle_max_arg = DeclareLaunchArgument(
         'cs_angle_max',
-        default_value='30.0',
+        default_value='0.0',
         description='CS controller angle maximum limit'
     )
 

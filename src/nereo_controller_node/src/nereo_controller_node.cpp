@@ -183,6 +183,7 @@ private:
     
     // Setpoints and state
     std::array<float, 4> setpoints_ = {0.0f};
+    std::array<float, 4> pid_input_errors_ = {0.0f, 0.0f, 0.0f, 0.0f}; // depth, roll, pitch, yaw
     std::array<uint8_t, 4> last_cmd_vel_neq_0_ = {1};
     bool first_update_ = true;
     std::array<bool, 4> manual_setpoint_ = {false, false, false, false}; // depth, roll, pitch, yaw
@@ -218,6 +219,7 @@ private:
                 float sp = static_cast<float>(this->get_parameter(sp_keys[i]).as_double());
                 if (setpoints_[i] != sp) {
                     setpoints_[i] = sp;
+                    pids_[i].reset();
                     RCLCPP_INFO(this->get_logger(), "Manual setpoint %s updated: %.4f", axis_names[i].c_str(), sp);
                 }
             }
@@ -437,6 +439,7 @@ private:
         switch (control_mode_) {
             case ControlMode::DIRECT_PASSTHROUGH:
                 output_cmd_vel = cmd_vel;
+                pid_input_errors_ = {0.0f, 0.0f, 0.0f, 0.0f};
                 break;
                 
             case ControlMode::PID_CONTROL:
@@ -468,17 +471,6 @@ private:
     }
     
     void publishDebugData() {
-        // Compute current values
-        std::array<float, 3> rpy_rads;
-        calculateRpyFromQuaternion(current_orientation_, rpy_rads);
-        
-        std::array<double, 4> current_values = {
-            static_cast<double>(current_pressure_),
-            static_cast<double>(rpy_rads[0]),  // roll
-            static_cast<double>(rpy_rads[1]),  // pitch
-            static_cast<double>(rpy_rads[2])   // yaw
-        };
-        
         // Publish setpoints: [depth, roll, pitch, yaw]
         auto sp_msg = std_msgs::msg::Float64MultiArray();
         sp_msg.data = {static_cast<double>(setpoints_[0]),
@@ -487,12 +479,12 @@ private:
                        static_cast<double>(setpoints_[3])};
         setpoints_pub_->publish(sp_msg);
         
-        // Publish errors: [depth_err, roll_err, pitch_err, yaw_err]
+        // Publish exactly the errors currently fed to the PID controllers
         auto err_msg = std_msgs::msg::Float64MultiArray();
-        err_msg.data = {static_cast<double>(setpoints_[0]) - current_values[0],
-                        static_cast<double>(setpoints_[1]) - current_values[1],
-                        static_cast<double>(setpoints_[2]) - current_values[2],
-                        static_cast<double>(wrap_phase(setpoints_[3] - current_values[3]))};
+        err_msg.data = {static_cast<double>(pid_input_errors_[0]),
+                        static_cast<double>(pid_input_errors_[1]),
+                        static_cast<double>(pid_input_errors_[2]),
+                        static_cast<double>(pid_input_errors_[3])};
         errors_pub_->publish(err_msg);
     }
     
@@ -527,6 +519,8 @@ private:
                 if (last_cmd_vel_neq_0_[i+1]) {
                     setpoints_[i+1] = rpy_rads[i];
                     count++;
+                    //reset PID state for this axis to avoid derivative kick and integral windup
+                    pids_[i+1].reset();
                 }
                 last_cmd_vel_neq_0_[i+1] = 0;
             } else {
@@ -547,6 +541,9 @@ private:
                 if (last_cmd_vel_neq_0_[0]) {
                     setpoints_[0] = current_pressure_;
                     count++;
+                    //reset PID state for this axis to avoid derivative kick and integral windup
+                    pids_[0].reset();
+
                 }
             }
         }
@@ -609,12 +606,19 @@ private:
         // Calculate PID outputs
         float yaw_error = setpoints_[3] - current_values[3];
         yaw_error = wrap_phase(yaw_error);
-        float roll_pid_feedback = pids_[1].compute(setpoints_[1] - current_values[1]);
-        float pitch_pid_feedback = pids_[2].compute(setpoints_[2] - current_values[2]);
+        float roll_error = wrap_phase(setpoints_[1] - current_values[1]);
+        float pitch_error = wrap_phase(setpoints_[2] - current_values[2]);
+
+        // Keep debug publisher aligned with the exact errors sent to PID.
+        float z_error = (setpoints_[0] - current_values[0])/100.0f;
+        pid_input_errors_ = {z_error, roll_error, pitch_error, yaw_error};
+
+        float roll_pid_feedback = -pids_[1].compute(roll_error);
+        float pitch_pid_feedback = pids_[2].compute(pitch_error);
         float yaw_pid_feedback = -pids_[3].compute(yaw_error);
         
         // Depth control
-        float z_pid_output = pids_[0].compute(setpoints_[0] - current_values[0]);
+        float z_pid_output = pids_[0].compute(z_error);
         
         // Convert z_pid_output to body frame
         Eigen::Vector3f z_out(0.0f, 0.0f, z_pid_output);
@@ -665,17 +669,24 @@ private:
         output_cmd_vel = cmd_vel;
         
         // Calculate PID outputs with anti-windup
-        float roll_pid_feedback = pids_[1].compute(setpoints_[1] - current_values[1]);
+        float roll_error = setpoints_[1] - current_values[1];
+        float pitch_error = setpoints_[2] - current_values[2];
+        float yaw_error = setpoints_[3] - current_values[3];
+        float z_error = setpoints_[0] - current_values[0];
+
+        pid_input_errors_ = {z_error, roll_error, pitch_error, yaw_error};
+
+        float roll_pid_feedback = pids_[1].compute(roll_error);
         pids_[1].state[0] += (clamp(roll_pid_feedback, 1.0f, -1.0f) - roll_pid_feedback) * anti_windup_gains[1];
         
-        float pitch_pid_feedback = pids_[2].compute(setpoints_[2] - current_values[2]);
+        float pitch_pid_feedback = pids_[2].compute(pitch_error);
         pids_[2].state[0] += (clamp(pitch_pid_feedback, 1.0f, -1.0f) - pitch_pid_feedback) * anti_windup_gains[2];
         
-        float yaw_pid_feedback = pids_[3].compute(setpoints_[3] - current_values[3]);
+        float yaw_pid_feedback = pids_[3].compute(yaw_error);
         pids_[3].state[0] += (clamp(yaw_pid_feedback, 1.0f, -1.0f) - yaw_pid_feedback) * anti_windup_gains[3];
         
         // Depth control with anti-windup
-        float z_pid_output = pids_[0].compute(setpoints_[0] - current_values[0]);
+        float z_pid_output = pids_[0].compute(z_error);
         pids_[0].state[0] += (clamp(z_pid_output, 1.0f, -1.0f) - z_pid_output) * anti_windup_gains[0];
         
         // Convert z_pid_output to body frame
@@ -735,7 +746,9 @@ private:
         
         // Yaw control still using PID as in the original
         //
-        float yaw_pid_feedback = pids_[3].compute(setpoints_[3] - current_values[3]);
+        float yaw_error = setpoints_[3] - current_values[3];
+        pid_input_errors_ = {0.0f, 0.0f, 0.0f, yaw_error};
+        float yaw_pid_feedback = pids_[3].compute(yaw_error);
         
         // Convert heave_correction to body frame
         Eigen::Vector3f z_out(0.0f, 0.0f, heave_correction);
