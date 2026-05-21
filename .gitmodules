@@ -1,0 +1,3 @@
+[submodule "src/nereo_interfaces"]
+	path = src/nereo_interfaces
+	url = https://github.com/PoliTOcean/nereo_interfaces.git
