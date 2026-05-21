@@ -47,6 +47,16 @@ ros2 run nereo_controller_node pid_tuner_gui.py --ros-args -p target_node:=/nere
 ros2 topic echo /nereo_cmd_vel
 ```
 
+### Run Automated Integration Tests
+
+Dopo aver avviato il controller, esegui la suite di test automatica:
+
+```sh
+python3 src/nereo_controller_node/test/test_nereo_controller.py
+```
+
+Il comando restituisce `0` se tutti i test passano, `1` se almeno un test fallisce.
+
 ### Set Parameters
 
 Set parameters for `/nereo_controller_node`:
