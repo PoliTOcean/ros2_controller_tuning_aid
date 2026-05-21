@@ -1,4 +1,5 @@
 #include "rclcpp/rclcpp.hpp"
+#include "rclcpp/qos.hpp"
 #include "nereo_interfaces/msg/command_velocity.hpp"
 #include "sensor_msgs/msg/imu.hpp"
 #include "sensor_msgs/msg/fluid_pressure.hpp"
@@ -50,18 +51,29 @@ struct PidController {
     float Kp;          // The proportional gain
     float Ki;          // The integral gain
     float Kd;          // The derivative gain
-    
-    // Compute function that mimics arm_pid_f32
-    float compute(float error) {
-        // y[n] = y[n-1] + A0 * x[n] + A1 * x[n-1] + A2 * x[n-2]
-        float out = (A0 * error) + (A1 * state[0]) + (A2 * state[1]) + state[2];
-        
+
+    // Computes output and exposes incremental P/I/D contributions used at this step.
+    float computeWithTerms(float error, float & p_term, float & i_term, float & d_term) {
+        p_term = Kp * (error - state[0]);
+        i_term = Ki * error;
+        d_term = Kd * (error - 2.0f * state[0] + state[1]);
+
+        float out = state[2] + p_term + i_term + d_term;
+
         // Update state
         state[1] = state[0];    // x[n-2] = x[n-1]
         state[0] = error;       // x[n-1] = x[n]
         state[2] = out;         // y[n-1] = y[n]
-        
+
         return out;
+    }
+    
+    // Compute function that mimics arm_pid_f32
+    float compute(float error) {
+        float p_term = 0.0f;
+        float i_term = 0.0f;
+        float d_term = 0.0f;
+        return computeWithTerms(error, p_term, i_term, d_term);
     }
     
     // Update coefficients when PID parameters change
@@ -92,10 +104,10 @@ public:
     NereoControllerNode() : Node("nereo_controller_node") {
         // Initialize parameters
         this->declare_parameter("control_mode", 0);
-        this->declare_parameter("kp", std::vector<double>{0.1, 0.1, 0.1, 0.1});
-        this->declare_parameter("ki", std::vector<double>{0.01, 0.01, 0.01, 0.01});
-        this->declare_parameter("kd", std::vector<double>{0.05, 0.05, 0.05, 0.05});
-        
+        this->declare_parameter("kp", std::vector<double>{0.0, 0.0, 0.0, 0.0});
+        this->declare_parameter("ki", std::vector<double>{0.0, 0.0, 0.0, 0.0});
+        this->declare_parameter("kd", std::vector<double>{0.0, 0.0, 0.0, 0.0});
+
         // Manual setpoint parameters (per-axis)
         this->declare_parameter("manual_setpoint_depth", false);
         this->declare_parameter("manual_setpoint_roll", false);
@@ -105,39 +117,46 @@ public:
         this->declare_parameter("setpoint_roll", 0.0);
         this->declare_parameter("setpoint_pitch", 0.0);
         this->declare_parameter("setpoint_yaw", 0.0);
-        
+
         // CS Controller parameters
-        this->declare_parameter("cs_kx0", std::vector<double>{198.0952, 468.0585});
-        this->declare_parameter("cs_kx1", std::vector<double>{3.8191, 6.0003});
-        this->declare_parameter("cs_kx2", std::vector<double>{5.2577, 11.8206});
-        this->declare_parameter("cs_ki0", -359.2481);
+        this->declare_parameter("cs_kx0", std::vector<double>{0.0, 0.0});
+        this->declare_parameter("cs_kx1", std::vector<double>{0.0, 0.0});
+        this->declare_parameter("cs_kx2", std::vector<double>{0.0, 0.0});
+        this->declare_parameter("cs_ki0", 0.0);
         this->declare_parameter("cs_ki1", 0.0);
-        this->declare_parameter("cs_ki2", -16.7389);
-        this->declare_parameter("cs_heave_min", -60.0);
-        this->declare_parameter("cs_heave_max", 80.0);
-        this->declare_parameter("cs_angle_min", -30.0);
-        this->declare_parameter("cs_angle_max", 30.0);
+        this->declare_parameter("cs_ki2", 0.0);
+        this->declare_parameter("cs_heave_min", 0.0);
+        this->declare_parameter("cs_heave_max", 0.0);
+        this->declare_parameter("cs_angle_min", 0.0);
+        this->declare_parameter("cs_angle_max", 0.0);
         
         // Initialize publishers and subscribers
         cmd_vel_pub_ = this->create_publisher<nereo_interfaces::msg::CommandVelocity>(
-            "/nereo_cmd_vel", 10);
+            "/nereo_cmd_vel_ctrl", 10);
             
         setpoints_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
             "/controller/setpoints", 10);
             
         errors_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
             "/controller/errors", 10);
+
+        pid_terms_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
+            "/controller/pid_terms", 10);
             
         cmd_vel_sub_ = this->create_subscription<nereo_interfaces::msg::CommandVelocity>(
             "/nereo_cmd_vel_no_fb", 10,
             std::bind(&NereoControllerNode::cmdVelCallback, this, std::placeholders::_1));
             
+        // Sensor data is published by microROS firmware with BEST_EFFORT reliability;
+        // match it here, otherwise messages never arrive.
+        auto sensor_qos = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort();
+
         imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
-            "/imu_data", 10,
+            "/imu_data", sensor_qos,
             std::bind(&NereoControllerNode::imuCallback, this, std::placeholders::_1));
-            
+
         pressure_sub_ = this->create_subscription<sensor_msgs::msg::FluidPressure>(
-            "/barometer_pressure", 10,
+            "/barometer_pressure", sensor_qos,
             std::bind(&NereoControllerNode::pressureCallback, this, std::placeholders::_1));
             
         // Timer for parameter checking
@@ -163,6 +182,7 @@ private:
     rclcpp::Publisher<nereo_interfaces::msg::CommandVelocity>::SharedPtr cmd_vel_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr setpoints_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr errors_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pid_terms_pub_;
     rclcpp::Subscription<nereo_interfaces::msg::CommandVelocity>::SharedPtr cmd_vel_sub_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
     rclcpp::Subscription<sensor_msgs::msg::FluidPressure>::SharedPtr pressure_sub_;
@@ -182,9 +202,13 @@ private:
     float Ki2_ = -16.7389f;
     
     // Setpoints and state
-    std::array<float, 4> setpoints_ = {0.0f};
+    std::array<float, 4> setpoints_ = {0.0f, 0.0f, 0.0f, 0.0f};
     std::array<float, 4> pid_input_errors_ = {0.0f, 0.0f, 0.0f, 0.0f}; // depth, roll, pitch, yaw
-    std::array<uint8_t, 4> last_cmd_vel_neq_0_ = {1};
+    std::array<float, 4> pid_p_terms_ = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::array<float, 4> pid_i_terms_ = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::array<float, 4> pid_d_terms_ = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::array<float, 4> pid_outputs_ = {0.0f, 0.0f, 0.0f, 0.0f};
+    std::array<uint8_t, 4> last_cmd_vel_neq_0_ = {1, 1, 1, 1};
     bool first_update_ = true;
     std::array<bool, 4> manual_setpoint_ = {false, false, false, false}; // depth, roll, pitch, yaw
     
@@ -311,7 +335,14 @@ private:
         double new_heave_max = this->get_parameter("cs_heave_max").as_double();
         double new_angle_min = this->get_parameter("cs_angle_min").as_double();
         double new_angle_max = this->get_parameter("cs_angle_max").as_double();
-        
+
+        if (controllers_[0].minForce != static_cast<float>(new_heave_min) ||
+            controllers_[0].maxForce != static_cast<float>(new_heave_max) ||
+            controllers_[1].minForce != static_cast<float>(new_angle_min) ||
+            controllers_[1].maxForce != static_cast<float>(new_angle_max)) {
+            cs_params_changed = true;
+        }
+
         // Update controllers if parameters have changed
         if (cs_params_changed) {
             controllers_[0] = ControlSystem(
@@ -440,6 +471,10 @@ private:
             case ControlMode::DIRECT_PASSTHROUGH:
                 output_cmd_vel = cmd_vel;
                 pid_input_errors_ = {0.0f, 0.0f, 0.0f, 0.0f};
+                pid_p_terms_ = {0.0f, 0.0f, 0.0f, 0.0f};
+                pid_i_terms_ = {0.0f, 0.0f, 0.0f, 0.0f};
+                pid_d_terms_ = {0.0f, 0.0f, 0.0f, 0.0f};
+                pid_outputs_ = {0.0f, 0.0f, 0.0f, 0.0f};
                 break;
                 
             case ControlMode::PID_CONTROL:
@@ -486,6 +521,16 @@ private:
                         static_cast<double>(pid_input_errors_[2]),
                         static_cast<double>(pid_input_errors_[3])};
         errors_pub_->publish(err_msg);
+
+        // Packed per axis in order depth, roll, pitch, yaw: [error, p_term, i_term, d_term, output]
+        auto pid_msg = std_msgs::msg::Float64MultiArray();
+        pid_msg.data = {
+            static_cast<double>(pid_input_errors_[0]), static_cast<double>(pid_p_terms_[0]), static_cast<double>(pid_i_terms_[0]), static_cast<double>(pid_d_terms_[0]), static_cast<double>(pid_outputs_[0]),
+            static_cast<double>(pid_input_errors_[1]), static_cast<double>(pid_p_terms_[1]), static_cast<double>(pid_i_terms_[1]), static_cast<double>(pid_d_terms_[1]), static_cast<double>(pid_outputs_[1]),
+            static_cast<double>(pid_input_errors_[2]), static_cast<double>(pid_p_terms_[2]), static_cast<double>(pid_i_terms_[2]), static_cast<double>(pid_d_terms_[2]), static_cast<double>(pid_outputs_[2]),
+            static_cast<double>(pid_input_errors_[3]), static_cast<double>(pid_p_terms_[3]), static_cast<double>(pid_i_terms_[3]), static_cast<double>(pid_d_terms_[3]), static_cast<double>(pid_outputs_[3])
+        };
+        pid_terms_pub_->publish(pid_msg);
     }
     
     void calculateRpyFromQuaternion(const Eigen::Quaternionf& q, std::array<float, 3>& rpy) {
@@ -575,7 +620,7 @@ private:
         return count;
     }
     
-    float clamp(float value, float max, float min) {
+    float clamp(float value, float min, float max) {
         if (value > max) return max;
         if (value < min) return min;
         return value;
@@ -613,12 +658,22 @@ private:
         float z_error = (setpoints_[0] - current_values[0])/100.0f;
         pid_input_errors_ = {z_error, roll_error, pitch_error, yaw_error};
 
-        float roll_pid_feedback = -pids_[1].compute(roll_error);
-        float pitch_pid_feedback = pids_[2].compute(pitch_error);
-        float yaw_pid_feedback = -pids_[3].compute(yaw_error);
+        float roll_p = 0.0f, roll_i = 0.0f, roll_d = 0.0f;
+        float pitch_p = 0.0f, pitch_i = 0.0f, pitch_d = 0.0f;
+        float yaw_p = 0.0f, yaw_i = 0.0f, yaw_d = 0.0f;
+        float z_p = 0.0f, z_i = 0.0f, z_d = 0.0f;
+
+        float roll_pid_feedback  = pids_[1].computeWithTerms(roll_error,  roll_p,  roll_i,  roll_d);
+        float pitch_pid_feedback = pids_[2].computeWithTerms(pitch_error, pitch_p, pitch_i, pitch_d);
+        float yaw_pid_feedback   = pids_[3].computeWithTerms(yaw_error,   yaw_p,   yaw_i,   yaw_d);
         
         // Depth control
-        float z_pid_output = pids_[0].compute(z_error);
+        float z_pid_output = pids_[0].computeWithTerms(z_error, z_p, z_i, z_d);
+
+        pid_p_terms_ = {z_p, roll_p, pitch_p, yaw_p};
+        pid_i_terms_ = {z_i, roll_i, pitch_i, yaw_i};
+        pid_d_terms_ = {z_d, roll_d, pitch_d, yaw_d};
+        pid_outputs_ = {z_pid_output, roll_pid_feedback, pitch_pid_feedback, yaw_pid_feedback};
         
         // Convert z_pid_output to body frame
         Eigen::Vector3f z_out(0.0f, 0.0f, z_pid_output);
@@ -644,7 +699,6 @@ private:
             output_cmd_vel[4] += pitch_pid_feedback;
         }
 
-        
         if (std::abs(yaw_pid_feedback) < TOLERANCE || std::abs(output_cmd_vel[5]) < TOLERANCE) {
             output_cmd_vel[5] += yaw_pid_feedback;
         }
@@ -669,25 +723,35 @@ private:
         output_cmd_vel = cmd_vel;
         
         // Calculate PID outputs with anti-windup
-        float roll_error = setpoints_[1] - current_values[1];
-        float pitch_error = setpoints_[2] - current_values[2];
-        float yaw_error = setpoints_[3] - current_values[3];
-        float z_error = setpoints_[0] - current_values[0];
+        float roll_error  = wrap_phase(setpoints_[1] - current_values[1]);
+        float pitch_error = wrap_phase(setpoints_[2] - current_values[2]);
+        float yaw_error   = wrap_phase(setpoints_[3] - current_values[3]);
+        float z_error = (setpoints_[0] - current_values[0]) / 100.0f;
 
         pid_input_errors_ = {z_error, roll_error, pitch_error, yaw_error};
 
-        float roll_pid_feedback = pids_[1].compute(roll_error);
-        pids_[1].state[0] += (clamp(roll_pid_feedback, 1.0f, -1.0f) - roll_pid_feedback) * anti_windup_gains[1];
-        
-        float pitch_pid_feedback = pids_[2].compute(pitch_error);
-        pids_[2].state[0] += (clamp(pitch_pid_feedback, 1.0f, -1.0f) - pitch_pid_feedback) * anti_windup_gains[2];
-        
-        float yaw_pid_feedback = pids_[3].compute(yaw_error);
-        pids_[3].state[0] += (clamp(yaw_pid_feedback, 1.0f, -1.0f) - yaw_pid_feedback) * anti_windup_gains[3];
-        
+        float roll_p = 0.0f, roll_i = 0.0f, roll_d = 0.0f;
+        float pitch_p = 0.0f, pitch_i = 0.0f, pitch_d = 0.0f;
+        float yaw_p = 0.0f, yaw_i = 0.0f, yaw_d = 0.0f;
+        float z_p = 0.0f, z_i = 0.0f, z_d = 0.0f;
+
+        float roll_pid_feedback = pids_[1].computeWithTerms(roll_error, roll_p, roll_i, roll_d);
+        pids_[1].state[2] += (clamp(roll_pid_feedback, -1.0f, 1.0f) - roll_pid_feedback) * anti_windup_gains[1];
+
+        float pitch_pid_feedback = pids_[2].computeWithTerms(pitch_error, pitch_p, pitch_i, pitch_d);
+        pids_[2].state[2] += (clamp(pitch_pid_feedback, -1.0f, 1.0f) - pitch_pid_feedback) * anti_windup_gains[2];
+
+        float yaw_pid_feedback = pids_[3].computeWithTerms(yaw_error, yaw_p, yaw_i, yaw_d);
+        pids_[3].state[2] += (clamp(yaw_pid_feedback, -1.0f, 1.0f) - yaw_pid_feedback) * anti_windup_gains[3];
+
         // Depth control with anti-windup
-        float z_pid_output = pids_[0].compute(z_error);
-        pids_[0].state[0] += (clamp(z_pid_output, 1.0f, -1.0f) - z_pid_output) * anti_windup_gains[0];
+        float z_pid_output = pids_[0].computeWithTerms(z_error, z_p, z_i, z_d);
+        pids_[0].state[2] += (clamp(z_pid_output, -1.0f, 1.0f) - z_pid_output) * anti_windup_gains[0];
+
+        pid_p_terms_ = {z_p, roll_p, pitch_p, yaw_p};
+        pid_i_terms_ = {z_i, roll_i, pitch_i, yaw_i};
+        pid_d_terms_ = {z_d, roll_d, pitch_d, yaw_d};
+        pid_outputs_  = {z_pid_output, roll_pid_feedback, pitch_pid_feedback, yaw_pid_feedback};
         
         // Convert z_pid_output to body frame
         Eigen::Vector3f z_out(0.0f, 0.0f, z_pid_output);
@@ -745,10 +809,14 @@ private:
         float pitch_correction = controllers_[2].calculateU(setpoints_[2], rpy_rads[1], pitch_measurements);
         
         // Yaw control still using PID as in the original
-        //
-        float yaw_error = setpoints_[3] - current_values[3];
+        float yaw_error = wrap_phase(setpoints_[3] - current_values[3]);
         pid_input_errors_ = {0.0f, 0.0f, 0.0f, yaw_error};
-        float yaw_pid_feedback = pids_[3].compute(yaw_error);
+        float yaw_p = 0.0f, yaw_i = 0.0f, yaw_d = 0.0f;
+        float yaw_pid_feedback = pids_[3].computeWithTerms(yaw_error, yaw_p, yaw_i, yaw_d);
+        pid_p_terms_ = {0.0f, 0.0f, 0.0f, yaw_p};
+        pid_i_terms_ = {0.0f, 0.0f, 0.0f, yaw_i};
+        pid_d_terms_ = {0.0f, 0.0f, 0.0f, yaw_d};
+        pid_outputs_ = {0.0f, 0.0f, 0.0f, yaw_pid_feedback};
         
         // Convert heave_correction to body frame
         Eigen::Vector3f z_out(0.0f, 0.0f, heave_correction);
@@ -783,7 +851,6 @@ private:
     }
 };
 
-// You need to implement the ControlSystem constructor and calculateU method
 ControlSystem::ControlSystem(float minForce, float maxForce, float Kx[2], float Ki) {
     this->minForce = minForce;
     this->maxForce = maxForce;
