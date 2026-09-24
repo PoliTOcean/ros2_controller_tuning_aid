@@ -210,12 +210,19 @@ def test_tuner_writer_round_trip(tester: NereoControllerTester) -> None:
 
     pid_tuner_gui.write_params_file(params_file, "/nereo_controller_node", values)
 
-    text = Path(params_file).read_text()
+    # The header comment is allowed to *mention* control_mode/manual
+    # setpoints in prose (it explains why they are absent); only the
+    # YAML body (non-comment lines) must never carry those keys.
+    body_lines = [
+        line for line in Path(params_file).read_text().splitlines()
+        if not line.strip().startswith("#")
+    ]
+    body = "\n".join(body_lines)
     NereoControllerTester._assert_true(
-        "control_mode" not in text, "written file must not contain control_mode"
+        "control_mode" not in body, "written file body must not contain control_mode"
     )
     NereoControllerTester._assert_true(
-        "manual_setpoint" not in text, "written file must not contain manual_setpoint"
+        "manual_setpoint" not in body, "written file body must not contain manual_setpoint"
     )
 
     proc = _start_node_with_params(params_file)

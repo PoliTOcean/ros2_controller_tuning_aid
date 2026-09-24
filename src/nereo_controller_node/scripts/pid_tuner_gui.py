@@ -1,15 +1,69 @@
 #!/usr/bin/env python3
 
+import os
 import subprocess
 import tkinter as tk
 from tkinter import ttk
 from typing import Dict, List, Tuple
 
 import rclpy
+import yaml
+from ament_index_python.packages import get_package_share_directory
 from rcl_interfaces.msg import ParameterType
 from rcl_interfaces.srv import GetParameters, SetParameters
 from rclpy.node import Node
 from rclpy.parameter import Parameter
+
+
+# ── Persisted params YAML (D-03/D-04) ───────────────────────────────────────
+# Order matches the committed config/controller_params.yaml exactly, so
+# write_params_file() reproduces it byte-for-byte from the same values.
+PERSISTED_PARAMS = [
+    "kp", "ki", "kd",
+    "anti_windup_gains", "authority_cap",
+    "cs_kx0", "cs_kx1", "cs_kx2",
+    "cs_ki0", "cs_ki1", "cs_ki2",
+    "cs_heave_min", "cs_heave_max", "cs_angle_min", "cs_angle_max",
+]
+
+PARAMS_FILE_HEADER = (
+    "# nereo_controller_node parameters, loaded by nereo_controller.launch.py.\n"
+    "# Written by pid_tuner_gui.py (Salva YAML); edit via the tuner or by hand.\n"
+    "# Gain arrays are ordered [depth, roll, pitch, yaw]; depth error in metres.\n"
+    "# control_mode and manual setpoints are deliberately not stored here.\n"
+)
+
+
+def write_params_file(path: str, node_name: str, values: Dict[str, object]) -> str:
+    """Write the D-03 persisted parameter set to a params YAML.
+
+    Raises KeyError, before opening anything, if a persisted name is
+    missing from `values`. Every value is coerced to float (or a list
+    of floats), so an int input (e.g. authority_cap=1) round-trips as
+    the declared ROS double. Writes through os.path.realpath(path), so
+    a colcon --symlink-install link is followed rather than replaced.
+    Returns the real path written.
+    """
+    for name in PERSISTED_PARAMS:
+        if name not in values:
+            raise KeyError(name)
+
+    ros_parameters: Dict[str, object] = {}
+    for name in PERSISTED_PARAMS:
+        value = values[name]
+        if isinstance(value, list):
+            ros_parameters[name] = [float(v) for v in value]
+        else:
+            ros_parameters[name] = float(value)
+
+    data = {node_name: {"ros__parameters": ros_parameters}}
+    body = yaml.safe_dump(data, default_flow_style=None, sort_keys=False)
+
+    real_path = os.path.realpath(path)
+    with open(real_path, "w") as f:
+        f.write(PARAMS_FILE_HEADER)
+        f.write(body)
+    return real_path
 
 
 # ── Palette ───────────────────────────────────────────────────────────────────
@@ -43,6 +97,13 @@ class PidTunerGui(Node):
         self.target_node = self.declare_parameter(
             "target_node", "/nereo_controller_node"
         ).value
+        default_params_file = os.path.join(
+            get_package_share_directory("nereo_controller_node"),
+            "config", "controller_params.yaml",
+        )
+        self.params_file = self.declare_parameter(
+            "params_file", default_params_file
+        ).value
         self.get_parameters_client = self.create_client(
             GetParameters, f"{self.target_node}/get_parameters"
         )
@@ -75,7 +136,9 @@ class PidTunerGui(Node):
             "kp": [tk.StringVar(value="0.0") for _ in range(4)],
             "ki": [tk.StringVar(value="0.0") for _ in range(4)],
             "kd": [tk.StringVar(value="0.0") for _ in range(4)],
+            "anti_windup_gains": [tk.StringVar(value="1.0") for _ in range(4)],
         }
+        self.authority_cap_var = tk.StringVar(value="0.0")
         self.manual_vars: Dict[str, tk.BooleanVar] = {
             "manual_setpoint_depth": tk.BooleanVar(value=False),
             "manual_setpoint_roll":  tk.BooleanVar(value=False),
@@ -105,6 +168,7 @@ class PidTunerGui(Node):
         self.parameter_order = [
             "control_mode",
             "kp", "ki", "kd",
+            "anti_windup_gains", "authority_cap",
             "manual_setpoint_depth", "manual_setpoint_roll",
             "manual_setpoint_pitch", "manual_setpoint_yaw",
             "setpoint_depth", "setpoint_roll", "setpoint_pitch", "setpoint_yaw",
@@ -228,6 +292,8 @@ class PidTunerGui(Node):
                      self.load_parameters).pack(side="left", padx=4)
         self._button(btn_f, "✔  Applica tutto",
                      self.apply_parameters, primary=True).pack(side="left", padx=4)
+        self._button(btn_f, "💾  Salva YAML",
+                     self.save_parameters).pack(side="left", padx=4)
         self._button(btn_f, "📈  PlotJuggler",
                      self.launch_plotjuggler).pack(side="left", padx=4)
 
@@ -284,15 +350,23 @@ class PidTunerGui(Node):
                     "0: passthrough  │  1: PID  │  2: PID anti-windup  │  3: CS",
                     fg=TEXT_DIM).grid(row=0, column=2, sticky="w")
 
+        # row 1: authority cap
+        self._label(inner, "Authority cap", fg=TEXT_LABEL).grid(
+            row=1, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+        self._entry(inner, self.authority_cap_var, width=8).grid(
+            row=1, column=1, sticky="w", pady=(6, 0))
+        self._label(inner, "0-1, max correction per axis", fg=TEXT_DIM).grid(
+            row=1, column=2, sticky="w", pady=(6, 0))
+
         # separator
         tk.Frame(inner, bg=BORDER, height=1).grid(
-            row=1, column=0, columnspan=3, sticky="ew", pady=(8, 6))
+            row=2, column=0, columnspan=3, sticky="ew", pady=(8, 6))
 
-        # row 2: panel filter as inline button group
+        # row 3: panel filter as inline button group
         self._label(inner, "Vista:", fg=TEXT_LABEL).grid(
-            row=2, column=0, sticky="w", padx=(0, 8))
+            row=3, column=0, sticky="w", padx=(0, 8))
         btn_row = tk.Frame(inner, bg=BG_PANEL)
-        btn_row.grid(row=2, column=1, columnspan=2, sticky="w")
+        btn_row.grid(row=3, column=1, columnspan=2, sticky="w")
 
         self._panel_btns: Dict[str, tk.Button] = {}
         for p in ["All", "PID", "Setpoint", "CS"]:
@@ -314,25 +388,26 @@ class PidTunerGui(Node):
             content, "PID GAINS  —  depth · roll · pitch · yaw")
         self._pid_outer.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 8))
         pid_inner.columnconfigure(0, weight=1, minsize=70)
-        for c in range(1, 4):
+        for c in range(1, 5):
             pid_inner.columnconfigure(c, weight=3)
 
         self._col_header(pid_inner, "AXIS", 0)
         self._col_header(pid_inner, "Kp",   1)
         self._col_header(pid_inner, "Ki",   2)
         self._col_header(pid_inner, "Kd",   3)
+        self._col_header(pid_inner, "Kaw",  4)
 
         axis_names = ["Depth", "Roll", "Pitch", "Yaw"]
         axis_icons = ["⬇", "↺", "↕", "↻"]
         for i, (axis, icon) in enumerate(zip(axis_names, axis_icons)):
             r = i + 1
             bg_r = BG_PANEL if i % 2 == 0 else BG_ROW_ALT
-            for col in range(4):
+            for col in range(5):
                 tk.Frame(pid_inner, bg=bg_r, height=32).grid(
                     row=r, column=col, sticky="nsew")
             self._label(pid_inner, f"{icon}  {axis}", fg=TEXT_MAIN).grid(
                 row=r, column=0, sticky="w", padx=6, pady=3)
-            for ci, key in enumerate(["kp", "ki", "kd"]):
+            for ci, key in enumerate(["kp", "ki", "kd", "anti_windup_gains"]):
                 self._entry(pid_inner, self.pid_vars[key][i]).grid(
                     row=r, column=ci + 1, sticky="ew", padx=6, pady=3)
 
@@ -515,6 +590,10 @@ class PidTunerGui(Node):
                           value=self._parse_array(self.pid_vars["ki"])),
                 Parameter(name="kd",
                           value=self._parse_array(self.pid_vars["kd"])),
+                Parameter(name="anti_windup_gains",
+                          value=self._parse_array(self.pid_vars["anti_windup_gains"])),
+                Parameter(name="authority_cap",
+                          value=self._parse_float_var(self.authority_cap_var)),
                 Parameter(name="manual_setpoint_depth",
                           value=bool(self.manual_vars["manual_setpoint_depth"].get())),
                 Parameter(name="manual_setpoint_roll",
@@ -598,9 +677,12 @@ class PidTunerGui(Node):
         if name == "control_mode":
             self.control_mode_var.set(str(value))
             return
-        if name in ("kp", "ki", "kd") and isinstance(value, list) and len(value) == 4:
+        if name in ("kp", "ki", "kd", "anti_windup_gains") and isinstance(value, list) and len(value) == 4:
             for i in range(4):
                 self.pid_vars[name][i].set(f"{float(value[i]):.6g}")
+            return
+        if name == "authority_cap":
+            self.authority_cap_var.set(f"{float(value):.6g}")
             return
         if name in self.manual_vars and isinstance(value, bool):
             self.manual_vars[name].set(value)
@@ -614,6 +696,37 @@ class PidTunerGui(Node):
             return
         if name in self.cs_scalar_vars:
             self.cs_scalar_vars[name].set(f"{float(value):.6g}")
+
+    def save_parameters(self) -> None:
+        if not self._services_ready():
+            self._set_status("Servizi parametri non disponibili", ERROR)
+            return
+        request = GetParameters.Request()
+        request.names = list(PERSISTED_PARAMS)
+        future = self.get_parameters_client.call_async(request)
+        future.add_done_callback(self._on_save_done)
+        self._set_status("Salvataggio in corso…", WARNING)
+
+    def _on_save_done(self, future) -> None:
+        try:
+            result = future.result()
+        except Exception as exc:
+            self._set_status(f"Errore lettura parametri: {exc}", ERROR)
+            return
+
+        values: Dict[str, object] = {}
+        for name, value in zip(PERSISTED_PARAMS, result.values):
+            decoded = self._decode_parameter_value(value)
+            if decoded is None:
+                self._set_status(f"Parametro mancante: {name} - file non scritto", ERROR)
+                return
+            values[name] = decoded
+
+        try:
+            real_path = write_params_file(self.params_file, self.target_node, values)
+            self._set_status(f"Parametri salvati in {real_path}", SUCCESS)
+        except OSError as exc:
+            self._set_status(f"Errore scrittura file: {exc}", ERROR)
 
     def launch_plotjuggler(self) -> None:
         if self.plotjuggler_process is not None and self.plotjuggler_process.poll() is None:
