@@ -493,11 +493,13 @@ private:
                 pids_[i].reset();
             }
         } else {
-            RCLCPP_WARN(this->get_logger(), "Invalid PID parameters, using defaults");
+            RCLCPP_WARN(this->get_logger(),
+                "Invalid PID parameters (kp/ki/kd need 4 values each): "
+                "all gains set to zero");
             for (size_t i = 0; i < PID_NUMBER; i++) {
-                pids_[i].Kp = 0.1f;
-                pids_[i].Ki = 0.01f;
-                pids_[i].Kd = 0.05f;
+                pids_[i].Kp = 0.0f;
+                pids_[i].Ki = 0.0f;
+                pids_[i].Kd = 0.0f;
                 pids_[i].updateCoefficients();
                 pids_[i].reset();
             }

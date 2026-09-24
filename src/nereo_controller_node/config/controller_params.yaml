@@ -1,0 +1,21 @@
+# nereo_controller_node parameters, loaded by nereo_controller.launch.py.
+# Written by pid_tuner_gui.py (Salva YAML); edit via the tuner or by hand.
+# Gain arrays are ordered [depth, roll, pitch, yaw]; depth error in metres.
+# control_mode and manual setpoints are deliberately not stored here.
+/nereo_controller_node:
+  ros__parameters:
+    kp: [0.0, 0.0, 0.0, 0.0]
+    ki: [0.0, 0.0, 0.0, 0.0]
+    kd: [0.0, 0.0, 0.0, 0.0]
+    anti_windup_gains: [1.0, 1.0, 1.0, 1.0]
+    authority_cap: 0.25
+    cs_kx0: [0.0, 0.0]
+    cs_kx1: [0.0, 0.0]
+    cs_kx2: [0.0, 0.0]
+    cs_ki0: 0.0
+    cs_ki1: 0.0
+    cs_ki2: 0.0
+    cs_heave_min: 0.0
+    cs_heave_max: 0.0
+    cs_angle_min: 0.0
+    cs_angle_max: 0.0
