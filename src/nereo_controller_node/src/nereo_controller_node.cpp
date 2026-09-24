@@ -227,7 +227,23 @@ private:
         
         if (new_mode != control_mode_) {
             control_mode_ = new_mode;
-            RCLCPP_INFO(this->get_logger(), "Control mode changed to: %d", mode);
+            // A mode change must never carry windup or a stale setpoint
+            // into its first cycle: zero every integrator and force the
+            // next updateSetpoints() to re-capture non-manual setpoints.
+            for (size_t i = 0; i < PID_NUMBER; i++) {
+                pids_[i].reset();
+            }
+            for (size_t i = 0; i < controllers_.size(); i++) {
+                controllers_[i].ErrorIntegral = 0.0f;
+            }
+            first_update_ = true;
+            RCLCPP_INFO(this->get_logger(),
+                "Control mode changed to: %d, integrators reset", mode);
+            if (mode < 0 || mode > 3) {
+                RCLCPP_WARN(this->get_logger(),
+                    "Unknown control_mode %d, passing pilot command through",
+                    mode);
+            }
         }
         
         // Check per-axis manual setpoint modes
@@ -473,8 +489,11 @@ private:
             msg->cmd_vel[5]   // yaw
         };
         
-        // Apply feedback based on control mode
-        std::array<float, 6> output_cmd_vel;
+        // Apply feedback based on control mode. Initialised to the pilot
+        // command so a control_mode matching no case below (an
+        // out-of-range value) publishes the pilot command unchanged
+        // instead of uninitialised memory.
+        std::array<float, 6> output_cmd_vel = cmd_vel;
         
         switch (control_mode_) {
             case ControlMode::DIRECT_PASSTHROUGH:

@@ -238,6 +238,59 @@ class NereoControllerTester(Node):
         finally:
             self.set_params({"manual_setpoint_depth": False})
 
+    def test_mode_change_resets_integrator(self):
+        # DEPTH-09: a mode change must zero every integrator and re-capture
+        # non-manual setpoints, so the first cycle after switching modes is
+        # neither wound up nor built on a stale setpoint. setpoint_depth 1.5
+        # is unique in this suite for the same reset-isolation reason as
+        # test_depth_metres_heave.
+        self.set_params({
+            "kp": [0.0, 0.0, 0.0, 0.0],
+            "ki": [0.1, 0.0, 0.0, 0.0],
+            "kd": [0.0, 0.0, 0.0, 0.0],
+            "control_mode": 1,
+            "manual_setpoint_depth": True,
+            "setpoint_depth": 1.5,
+        })
+
+        try:
+            self.publish_imu(1.0, 0.0, 0.0, 0.0)
+            self.publish_depth(2.5)
+            self.spin_for(0.2)
+
+            out = None
+            for _ in range(5):
+                out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            self._assert_true(
+                abs(out.cmd_vel[2]) >= 0.45,
+                f"integrator should have wound up, got heave={out.cmd_vel[2]:.4f}",
+            )
+
+            self.set_params({"control_mode": 2})
+            out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            self._assert_close(
+                out.cmd_vel[2],
+                HEAVE_SIGN * 0.1,
+                0.02,
+                "heave on first cycle after mode change (must not carry windup)",
+            )
+        finally:
+            self.set_params({"manual_setpoint_depth": False, "control_mode": 1})
+
+    def test_invalid_mode_passthrough(self):
+        # An out-of-range control_mode must publish the pilot command
+        # unchanged instead of an uninitialised output array.
+        self.set_params({"control_mode": 7})
+
+        try:
+            self._prime_sensors()
+            cmd = [0.3, -0.2, 0.1, 0.05, -0.05, 0.1]
+            out = self.send_and_wait(cmd)
+            for i, axis in enumerate(["surge", "sway", "heave", "roll", "pitch", "yaw"]):
+                self._assert_close(out.cmd_vel[i], cmd[i], 0.001, f"invalid mode passthrough {axis}")
+        finally:
+            self.set_params({"control_mode": 0})
+
     def test_setpoint_update_on_zero_command(self):
         self.set_pid_gains([0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0])
         self.set_control_mode(1)
@@ -277,6 +330,8 @@ def main() -> int:
         ("passthrough", tester.test_passthrough),
         ("pid_roll_correction", tester.test_pid_roll_correction),
         ("depth_metres_heave", tester.test_depth_metres_heave),
+        ("mode_change_resets_integrator", tester.test_mode_change_resets_integrator),
+        ("invalid_mode_passthrough", tester.test_invalid_mode_passthrough),
         ("setpoint_update_on_zero_command", tester.test_setpoint_update_on_zero_command),
     ]
 
