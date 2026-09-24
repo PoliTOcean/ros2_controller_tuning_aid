@@ -4,6 +4,8 @@
 #include "sensor_msgs/msg/imu.hpp"
 #include "std_msgs/msg/float32.hpp"
 #include "std_msgs/msg/float64_multi_array.hpp"
+#include "rcl_interfaces/msg/parameter_descriptor.hpp"
+#include "rcl_interfaces/msg/floating_point_range.hpp"
 #include <cmath>
 #include <array>
 #include <vector>
@@ -108,6 +110,23 @@ public:
         this->declare_parameter("ki", std::vector<double>{0.0, 0.0, 0.0, 0.0});
         this->declare_parameter("kd", std::vector<double>{0.0, 0.0, 0.0, 0.0});
 
+        // Bounds only the correction the controller adds to the pilot
+        // command, never the pilot's own input (D-08). 0 disables
+        // feedback; a missing or malformed value must fail toward 0,
+        // never toward more authority (DEPTH-10).
+        rcl_interfaces::msg::ParameterDescriptor authority_cap_descriptor;
+        authority_cap_descriptor.description =
+            "max |correction| the controller adds to each pilot axis; "
+            "0 disables feedback; applies in modes 1-3";
+        rcl_interfaces::msg::FloatingPointRange authority_cap_range;
+        authority_cap_range.from_value = 0.0;
+        authority_cap_range.to_value = 1.0;
+        authority_cap_range.step = 0.0;
+        authority_cap_descriptor.floating_point_range.push_back(
+            authority_cap_range);
+        this->declare_parameter("authority_cap", 0.0,
+            authority_cap_descriptor);
+
         // Manual setpoint parameters (per-axis)
         this->declare_parameter("manual_setpoint_depth", false);
         this->declare_parameter("manual_setpoint_roll", false);
@@ -171,7 +190,11 @@ public:
         
         // Initialize CS controller
         initControllers();
-        
+
+        // So authority_cap and every other parameter are live before the
+        // first command, instead of waiting for the 1 Hz timer.
+        checkParameters();
+
         // Initialize other variables
         first_update_ = true;
         last_cmd_vel_neq_0_ = {1, 1, 1, 1};
@@ -219,6 +242,10 @@ private:
     float current_depth_m_ = 0.0f;
     bool has_orientation_ = false;
     bool has_depth_ = false;
+
+    // Bounds every feedback correction added to the pilot command
+    // (D-08); code default 0.0 so a missing config yields no feedback.
+    float authority_cap_ = 0.0f;
     
     void checkParameters() {
         // Check if control mode parameter has changed
@@ -294,6 +321,24 @@ private:
                 }
                 RCLCPP_INFO(this->get_logger(), "PID parameters updated");
             }
+        }
+
+        // Authority cap bounds only the feedback correction (D-08); a
+        // non-finite value must fail toward 0.0, never toward 1.0.
+        double raw_cap = this->get_parameter("authority_cap").as_double();
+        float new_cap = static_cast<float>(raw_cap);
+        if (!std::isfinite(new_cap)) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(),
+                10000, "authority_cap is non-finite, using 0.0");
+            new_cap = 0.0f;
+        }
+        if (new_cap != authority_cap_) {
+            authority_cap_ = new_cap;
+            for (size_t i = 0; i < PID_NUMBER; i++) {
+                pids_[i].reset();
+            }
+            RCLCPP_INFO(this->get_logger(), "Authority cap set to %.3f",
+                authority_cap_);
         }
 
         // Check if CS controller parameters have changed
@@ -654,6 +699,17 @@ private:
         return value;
     }
 
+    // Bounds only the correction the controller adds; the pilot's own
+    // command in output_cmd_vel is never passed through this (D-08). A
+    // non-finite feedback resolves to 0.0, never to the cap (fail
+    // toward zero authority, DEPTH-10).
+    float capFeedback(float feedback) {
+        if (!std::isfinite(feedback)) {
+            return 0.0f;
+        }
+        return clamp(feedback, -authority_cap_, authority_cap_);
+    }
+
     static float wrap_phase(float angle) {
         while (angle > M_PI) angle -= 2 * M_PI;
         while (angle < -M_PI) angle += 2 * M_PI;
@@ -722,22 +778,22 @@ private:
         bool z_condition = std::abs(z_out_RBF.z()) < TOLERANCE || std::abs(output_cmd_vel[2]) < TOLERANCE;
         
         if (x_condition && y_condition && z_condition) {
-            output_cmd_vel[0] += z_out_RBF.x();
-            output_cmd_vel[1] += z_out_RBF.y();
-            output_cmd_vel[2] += z_out_RBF.z();
+            output_cmd_vel[0] += capFeedback(z_out_RBF.x());
+            output_cmd_vel[1] += capFeedback(z_out_RBF.y());
+            output_cmd_vel[2] += capFeedback(z_out_RBF.z());
         }
         
         // Apply roll, pitch, and yaw feedback
         if (std::abs(roll_pid_feedback) < TOLERANCE || std::abs(output_cmd_vel[3]) < TOLERANCE) {
-            output_cmd_vel[3] += roll_pid_feedback;
+            output_cmd_vel[3] += capFeedback(roll_pid_feedback);
         }
 
         if (std::abs(pitch_pid_feedback) < TOLERANCE || std::abs(output_cmd_vel[4]) < TOLERANCE) {
-            output_cmd_vel[4] += pitch_pid_feedback;
+            output_cmd_vel[4] += capFeedback(pitch_pid_feedback);
         }
 
         if (std::abs(yaw_pid_feedback) < TOLERANCE || std::abs(output_cmd_vel[5]) < TOLERANCE) {
-            output_cmd_vel[5] += yaw_pid_feedback;
+            output_cmd_vel[5] += capFeedback(yaw_pid_feedback);
         }
     }
     
@@ -800,20 +856,20 @@ private:
         bool z_condition = std::abs(z_out_RBF.z()) < TOLERANCE || std::abs(output_cmd_vel[2]) < TOLERANCE;
         
         if (x_condition && y_condition && z_condition) {
-            output_cmd_vel[0] += z_out_RBF.x();
-            output_cmd_vel[1] += z_out_RBF.y();
-            output_cmd_vel[2] += z_out_RBF.z();
+            output_cmd_vel[0] += capFeedback(z_out_RBF.x());
+            output_cmd_vel[1] += capFeedback(z_out_RBF.y());
+            output_cmd_vel[2] += capFeedback(z_out_RBF.z());
         }
         
         // Apply roll, pitch, and yaw feedback
         if (std::abs(roll_pid_feedback) < TOLERANCE || std::abs(output_cmd_vel[3]) < TOLERANCE) {
-            output_cmd_vel[3] += roll_pid_feedback;
+            output_cmd_vel[3] += capFeedback(roll_pid_feedback);
         }
         if (std::abs(pitch_pid_feedback) < TOLERANCE || std::abs(output_cmd_vel[4]) < TOLERANCE) {
-            output_cmd_vel[4] += pitch_pid_feedback;
+            output_cmd_vel[4] += capFeedback(pitch_pid_feedback);
         }
         if (std::abs(yaw_pid_feedback) < TOLERANCE || std::abs(output_cmd_vel[5]) < TOLERANCE) {
-            output_cmd_vel[5] += yaw_pid_feedback;
+            output_cmd_vel[5] += capFeedback(yaw_pid_feedback);
         }
     }
     
@@ -870,22 +926,22 @@ private:
         bool z_condition = std::abs(z_out_RBF.z()) < TOLERANCE || std::abs(output_cmd_vel[2]) < TOLERANCE;
         
         if (x_condition && y_condition && z_condition) {
-            output_cmd_vel[0] += z_out_RBF.x();
-            output_cmd_vel[1] += z_out_RBF.y();
-            output_cmd_vel[2] += z_out_RBF.z();
+            output_cmd_vel[0] += capFeedback(z_out_RBF.x());
+            output_cmd_vel[1] += capFeedback(z_out_RBF.y());
+            output_cmd_vel[2] += capFeedback(z_out_RBF.z());
         }
         
         // Apply roll, pitch, and yaw feedback
         if (std::abs(roll_correction) < TOLERANCE || std::abs(output_cmd_vel[3]) < TOLERANCE) {
-            output_cmd_vel[3] += roll_correction;
+            output_cmd_vel[3] += capFeedback(roll_correction);
         }
         
         if (std::abs(pitch_correction) < TOLERANCE || std::abs(output_cmd_vel[4]) < TOLERANCE) {
-            output_cmd_vel[4] += pitch_correction;
+            output_cmd_vel[4] += capFeedback(pitch_correction);
         }
         
         if (std::abs(yaw_pid_feedback) < TOLERANCE || std::abs(output_cmd_vel[5]) < TOLERANCE) {
-            output_cmd_vel[5] += yaw_pid_feedback;
+            output_cmd_vel[5] += capFeedback(yaw_pid_feedback);
         }
         
         RCLCPP_DEBUG(this->get_logger(), "CS Controller outputs: Heave: %.2f, Roll: %.2f, Pitch: %.2f, Yaw: %.2f",

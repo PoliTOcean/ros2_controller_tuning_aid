@@ -128,6 +128,14 @@ class NereoControllerTester(Node):
     def set_manual_depth_setpoint(self, enabled: bool, depth_value: float):
         self.set_params({"manual_setpoint_depth": enabled, "setpoint_depth": depth_value})
 
+    def _assert_within_cap(self, out: CommandVelocity, pilot: Sequence[float], cap: float, label: str):
+        for i, axis in enumerate(["surge", "sway", "heave", "roll", "pitch", "yaw"]):
+            diff = abs(out.cmd_vel[i] - pilot[i])
+            self._assert_true(
+                diff <= cap + 0.001,
+                f"{label} {axis}: correction {diff:.4f} exceeds cap {cap:.4f}",
+            )
+
     def publish_imu(self, w: float, x: float, y: float, z: float):
         msg = Imu()
         msg.orientation.w = w
@@ -238,6 +246,85 @@ class NereoControllerTester(Node):
         finally:
             self.set_params({"manual_setpoint_depth": False})
 
+    def test_authority_cap(self):
+        # DEPTH-10/D-08: authority_cap bounds only the correction the
+        # controller adds, saturating exactly at the cap, never the
+        # pilot's own command component.
+        self.set_params({
+            "kp": [1.0, 0.0, 0.0, 0.0],
+            "ki": [0.0, 0.0, 0.0, 0.0],
+            "kd": [0.0, 0.0, 0.0, 0.0],
+            "control_mode": 1,
+            "authority_cap": 0.25,
+            "manual_setpoint_depth": True,
+            "setpoint_depth": 0.0,
+        })
+
+        try:
+            self.publish_imu(1.0, 0.0, 0.0, 0.0)
+
+            # Above the cap: saturates.
+            self.publish_depth(2.0)
+            self.spin_for(0.2)
+            out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            self._assert_close(out.cmd_vel[2], HEAVE_SIGN * 0.25, 0.001, "heave saturates above cap")
+            self._assert_within_cap(out, [0.0] * 6, 0.25, "above cap")
+
+            # Exactly at the cap: unchanged.
+            self.publish_depth(0.25)
+            self.spin_for(0.2)
+            out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            self._assert_close(out.cmd_vel[2], HEAVE_SIGN * 0.25, 0.001, "heave exactly at cap")
+            self._assert_within_cap(out, [0.0] * 6, 0.25, "at cap")
+
+            # One step below the cap: unchanged.
+            self.publish_depth(0.2)
+            self.spin_for(0.2)
+            out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            self._assert_close(out.cmd_vel[2], HEAVE_SIGN * 0.2, 0.001, "heave one step below cap")
+            self._assert_within_cap(out, [0.0] * 6, 0.25, "below cap")
+
+            # Pilot authority: surge/sway never carry depth feedback under
+            # an identity orientation, so they pass through unmodified
+            # even while a capped depth correction is active on heave.
+            pilot = [0.9, 0.0, 0.9, 0.0, 0.0, 0.0]
+            out = self.send_and_wait(pilot)
+            self._assert_close(out.cmd_vel[0], 0.9, 0.001, "pilot surge passes through unmodified")
+            self._assert_within_cap(out, pilot, 0.25, "pilot command plus capped correction")
+
+            # Depth back at setpoint: the correction is exactly zero, so
+            # the pilot's own heave command also comes back unmodified.
+            self.publish_depth(0.0)
+            self.spin_for(0.2)
+            out = self.send_and_wait(pilot)
+            self._assert_close(out.cmd_vel[0], 0.9, 0.001, "pilot surge passes through unmodified")
+            self._assert_close(out.cmd_vel[2], 0.9, 0.001, "pilot heave passes through unmodified at zero error")
+
+            # authority_cap 0.0 disables feedback entirely (fail toward
+            # zero authority, never toward more).
+            self.set_params({"authority_cap": 0.0})
+            self.publish_depth(2.0)
+            self.spin_for(0.2)
+            out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            self._assert_close(out.cmd_vel[2], 0.0, 0.001, "authority_cap 0.0 disables feedback")
+
+            # Out-of-range values are rejected by the FloatingPointRange.
+            rejected = False
+            try:
+                self.set_params({"authority_cap": -0.01})
+            except RuntimeError:
+                rejected = True
+            self._assert_true(rejected, "authority_cap -0.01 should be rejected")
+
+            rejected = False
+            try:
+                self.set_params({"authority_cap": 1.01})
+            except RuntimeError:
+                rejected = True
+            self._assert_true(rejected, "authority_cap 1.01 should be rejected")
+        finally:
+            self.set_params({"authority_cap": 1.0, "manual_setpoint_depth": False})
+
     def test_mode_change_resets_integrator(self):
         # DEPTH-09: a mode change must zero every integrator and re-capture
         # non-manual setpoints, so the first cycle after switching modes is
@@ -314,6 +401,16 @@ class NereoControllerTester(Node):
         self._assert_true(abs(out.cmd_vel[3]) < 0.08, f"roll should be near zero after setpoint update, got {out.cmd_vel[3]:.4f}")
 
 
+def setup_suite(tester: NereoControllerTester):
+    """Suite-wide defaults so per-test parameter sets stay minimal.
+
+    authority_cap defaults to 0.0 (fail toward zero authority, D-08); the
+    pre-04-03 tests assume an unclamped +/-1 feedback range, so the suite
+    opens it back up before any test runs.
+    """
+    tester.set_params({"authority_cap": 1.0})
+
+
 def run_test_case(tester: NereoControllerTester, name: str, fn) -> TestResult:
     try:
         fn()
@@ -325,11 +422,13 @@ def run_test_case(tester: NereoControllerTester, name: str, fn) -> TestResult:
 def main() -> int:
     rclpy.init()
     tester = NereoControllerTester()
+    setup_suite(tester)
 
     tests = [
         ("passthrough", tester.test_passthrough),
         ("pid_roll_correction", tester.test_pid_roll_correction),
         ("depth_metres_heave", tester.test_depth_metres_heave),
+        ("authority_cap", tester.test_authority_cap),
         ("mode_change_resets_integrator", tester.test_mode_change_resets_integrator),
         ("invalid_mode_passthrough", tester.test_invalid_mode_passthrough),
         ("setpoint_update_on_zero_command", tester.test_setpoint_update_on_zero_command),
