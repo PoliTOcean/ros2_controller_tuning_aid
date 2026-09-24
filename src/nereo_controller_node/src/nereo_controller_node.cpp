@@ -127,6 +127,13 @@ public:
         this->declare_parameter("authority_cap", 0.0,
             authority_cap_descriptor);
 
+        // Anti-windup back-calculation gains (D-06); a malformed value
+        // keeps the previous one instead of falling back to a fixed
+        // default, so a bad set_parameters call cannot silently change
+        // behaviour.
+        this->declare_parameter("anti_windup_gains",
+            std::vector<double>{1.0, 1.0, 1.0, 1.0});
+
         // Manual setpoint parameters (per-axis)
         this->declare_parameter("manual_setpoint_depth", false);
         this->declare_parameter("manual_setpoint_roll", false);
@@ -246,6 +253,9 @@ private:
     // Bounds every feedback correction added to the pilot command
     // (D-08); code default 0.0 so a missing config yields no feedback.
     float authority_cap_ = 0.0f;
+
+    // Anti-windup back-calculation gains, one per PID axis (D-06).
+    std::array<float, PID_NUMBER> anti_windup_gains_ = {1.0f, 1.0f, 1.0f, 1.0f};
     
     void checkParameters() {
         // Check if control mode parameter has changed
@@ -339,6 +349,48 @@ private:
             }
             RCLCPP_INFO(this->get_logger(), "Authority cap set to %.3f",
                 authority_cap_);
+        }
+
+        // Anti-windup gains (D-06): accepted only with 4 finite values
+        // >= 0; otherwise keep the previous value rather than a fixed
+        // fallback, so a bad set_parameters call cannot silently rewrite
+        // the behaviour of the axes that were not part of the request.
+        auto anti_windup_values =
+            this->get_parameter("anti_windup_gains").as_double_array();
+        bool anti_windup_valid = anti_windup_values.size() == PID_NUMBER;
+        if (anti_windup_valid) {
+            for (size_t i = 0; i < PID_NUMBER; i++) {
+                if (!std::isfinite(anti_windup_values[i]) ||
+                    anti_windup_values[i] < 0.0) {
+                    anti_windup_valid = false;
+                    break;
+                }
+            }
+        }
+        if (anti_windup_valid) {
+            bool anti_windup_changed = false;
+            for (size_t i = 0; i < PID_NUMBER; i++) {
+                if (anti_windup_gains_[i] !=
+                    static_cast<float>(anti_windup_values[i])) {
+                    anti_windup_changed = true;
+                    break;
+                }
+            }
+            if (anti_windup_changed) {
+                for (size_t i = 0; i < PID_NUMBER; i++) {
+                    anti_windup_gains_[i] =
+                        static_cast<float>(anti_windup_values[i]);
+                }
+                for (size_t i = 0; i < PID_NUMBER; i++) {
+                    pids_[i].reset();
+                }
+                RCLCPP_INFO(this->get_logger(), "Anti-windup gains updated");
+            }
+        } else {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(),
+                10000,
+                "anti_windup_gains needs 4 finite values >= 0, "
+                "keeping previous");
         }
 
         // Check if CS controller parameters have changed
@@ -798,8 +850,6 @@ private:
     }
     
     void calculateFeedbackWithPidAntiWindup(const std::array<float, 6>& cmd_vel, std::array<float, 6>& output_cmd_vel) {
-        static const std::array<float, 4> anti_windup_gains = {1.0f, 1.0f, 1.0f, 1.0f};
-        
         // Calculate current values (z, roll, pitch, yaw)
         std::array<float, 4> current_values;
         std::array<float, 3> rpy_rads;
@@ -829,17 +879,29 @@ private:
         float z_p = 0.0f, z_i = 0.0f, z_d = 0.0f;
 
         float roll_pid_feedback = pids_[1].computeWithTerms(roll_error, roll_p, roll_i, roll_d);
-        pids_[1].state[2] += (clamp(roll_pid_feedback, -1.0f, 1.0f) - roll_pid_feedback) * anti_windup_gains[1];
+        float roll_capped =
+            clamp(roll_pid_feedback, -authority_cap_, authority_cap_);
+        pids_[1].state[2] +=
+            (roll_capped - roll_pid_feedback) * anti_windup_gains_[1];
 
         float pitch_pid_feedback = pids_[2].computeWithTerms(pitch_error, pitch_p, pitch_i, pitch_d);
-        pids_[2].state[2] += (clamp(pitch_pid_feedback, -1.0f, 1.0f) - pitch_pid_feedback) * anti_windup_gains[2];
+        float pitch_capped =
+            clamp(pitch_pid_feedback, -authority_cap_, authority_cap_);
+        pids_[2].state[2] +=
+            (pitch_capped - pitch_pid_feedback) * anti_windup_gains_[2];
 
         float yaw_pid_feedback = pids_[3].computeWithTerms(yaw_error, yaw_p, yaw_i, yaw_d);
-        pids_[3].state[2] += (clamp(yaw_pid_feedback, -1.0f, 1.0f) - yaw_pid_feedback) * anti_windup_gains[3];
+        float yaw_capped =
+            clamp(yaw_pid_feedback, -authority_cap_, authority_cap_);
+        pids_[3].state[2] +=
+            (yaw_capped - yaw_pid_feedback) * anti_windup_gains_[3];
 
         // Depth control with anti-windup
         float z_pid_output = pids_[0].computeWithTerms(z_error, z_p, z_i, z_d);
-        pids_[0].state[2] += (clamp(z_pid_output, -1.0f, 1.0f) - z_pid_output) * anti_windup_gains[0];
+        float z_capped =
+            clamp(z_pid_output, -authority_cap_, authority_cap_);
+        pids_[0].state[2] +=
+            (z_capped - z_pid_output) * anti_windup_gains_[0];
 
         pid_p_terms_ = {z_p, roll_p, pitch_p, yaw_p};
         pid_i_terms_ = {z_i, roll_i, pitch_i, yaw_i};

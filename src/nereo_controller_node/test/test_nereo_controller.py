@@ -325,6 +325,52 @@ class NereoControllerTester(Node):
         finally:
             self.set_params({"authority_cap": 1.0, "manual_setpoint_depth": False})
 
+    def test_anti_windup_gains(self):
+        # DEPTH-07/D-06: anti_windup_gains is a validated parameter; the
+        # back-calculation saturates at authority_cap, so gain=1 stops the
+        # integrator from winding past the cap and gain=0 leaves it wound.
+        def run_reversal(gains: Sequence[float]) -> float:
+            self.set_params({
+                "kp": [0.0, 0.0, 0.0, 0.0],
+                "ki": [0.5, 0.0, 0.0, 0.0],
+                "kd": [0.0, 0.0, 0.0, 0.0],
+                "control_mode": 2,
+                "authority_cap": 0.3,
+                "anti_windup_gains": list(gains),
+                "manual_setpoint_depth": True,
+                "setpoint_depth": 2.0,
+            })
+            self.publish_imu(1.0, 0.0, 0.0, 0.0)
+            self.publish_depth(4.0)
+            self.spin_for(0.2)
+
+            out = None
+            for _ in range(5):
+                out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            self._assert_close(
+                out.cmd_vel[2], HEAVE_SIGN * 0.3, 0.001,
+                f"heave saturated at cap before reversal, gains={gains}",
+            )
+
+            self.publish_depth(0.0)
+            self.spin_for(0.2)
+            out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            return out.cmd_vel[2]
+
+        try:
+            heave_with_gain = run_reversal([1.0, 1.0, 1.0, 1.0])
+            self._assert_close(heave_with_gain, -HEAVE_SIGN * 0.3, 0.001, "gain=1 flips sign on reversal")
+
+            heave_without_gain = run_reversal([0.0, 0.0, 0.0, 0.0])
+            self._assert_close(heave_without_gain, HEAVE_SIGN * 0.3, 0.001, "gain=0 keeps integrator wound")
+        finally:
+            self.set_params({
+                "anti_windup_gains": [1.0, 1.0, 1.0, 1.0],
+                "authority_cap": 1.0,
+                "manual_setpoint_depth": False,
+                "control_mode": 0,
+            })
+
     def test_mode_change_resets_integrator(self):
         # DEPTH-09: a mode change must zero every integrator and re-capture
         # non-manual setpoints, so the first cycle after switching modes is
@@ -408,7 +454,7 @@ def setup_suite(tester: NereoControllerTester):
     pre-04-03 tests assume an unclamped +/-1 feedback range, so the suite
     opens it back up before any test runs.
     """
-    tester.set_params({"authority_cap": 1.0})
+    tester.set_params({"authority_cap": 1.0, "anti_windup_gains": [1.0, 1.0, 1.0, 1.0]})
 
 
 def run_test_case(tester: NereoControllerTester, name: str, fn) -> TestResult:
@@ -429,6 +475,7 @@ def main() -> int:
         ("pid_roll_correction", tester.test_pid_roll_correction),
         ("depth_metres_heave", tester.test_depth_metres_heave),
         ("authority_cap", tester.test_authority_cap),
+        ("anti_windup_gains", tester.test_anti_windup_gains),
         ("mode_change_resets_integrator", tester.test_mode_change_resets_integrator),
         ("invalid_mode_passthrough", tester.test_invalid_mode_passthrough),
         ("setpoint_update_on_zero_command", tester.test_setpoint_update_on_zero_command),
