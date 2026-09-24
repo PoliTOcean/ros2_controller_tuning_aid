@@ -11,7 +11,16 @@ from rcl_interfaces.msg import Parameter as ParameterMsg
 from rcl_interfaces.msg import ParameterType
 from rcl_interfaces.srv import SetParameters
 from rclpy.node import Node
-from sensor_msgs.msg import FluidPressure, Imu
+from sensor_msgs.msg import Imu
+from std_msgs.msg import Float32
+
+# Task 1 decision (2026-09-24, operator): positive heave ascends. This
+# matches the joystick mapping (right stick up -> +cmd_vel[2]), the web
+# joystick's "up -> positive heave" comment, and the bench-verified
+# vertical thruster rows. The controller's depthError() is therefore
+# current_depth_m_ - setpoints_[0]: a vehicle deeper than its setpoint
+# gets a positive (ascending) heave correction.
+HEAVE_SIGN = 1
 
 
 @dataclass
@@ -27,10 +36,10 @@ class NereoControllerTester(Node):
 
         self.cmd_vel_pub = self.create_publisher(CommandVelocity, "/nereo_cmd_vel_no_fb", 10)
         self.imu_pub = self.create_publisher(Imu, "/imu_data", 10)
-        self.pressure_pub = self.create_publisher(FluidPressure, "/barometer_pressure", 10)
+        self.depth_pub = self.create_publisher(Float32, "/barometer_depth", 10)
         self.cmd_vel_sub = self.create_subscription(
             CommandVelocity,
-            "/nereo_cmd_vel",
+            "/nereo_cmd_vel_ctrl",
             self.cmd_vel_callback,
             10,
         )
@@ -56,7 +65,7 @@ class NereoControllerTester(Node):
             rclpy.spin_once(self, timeout_sec=0.05)
             if self.response_seq > previous_seq and self.latest_cmd_vel is not None:
                 return self.latest_cmd_vel
-        raise TimeoutError("Timeout waiting for /nereo_cmd_vel response")
+        raise TimeoutError("Timeout waiting for /nereo_cmd_vel_ctrl response")
 
     def _call_set_parameters(self, parameters: Sequence[ParameterMsg]):
         while not self.parameter_client.wait_for_service(timeout_sec=1.0):
@@ -79,49 +88,45 @@ class NereoControllerTester(Node):
                 return
         raise TimeoutError("Timeout waiting for set_parameters response")
 
-    def set_control_mode(self, mode: int):
-        p = ParameterMsg()
-        p.name = "control_mode"
-        p.value.type = ParameterType.PARAMETER_INTEGER
-        p.value.integer_value = mode
-        self._call_set_parameters([p])
+    def set_params(self, values: dict):
+        """Build one SetParameters call from plain Python types and wait
+        for the controller's 1 Hz parameter poll to pick it up.
+
+        bool -> PARAMETER_BOOL, int -> PARAMETER_INTEGER,
+        float -> PARAMETER_DOUBLE, list -> PARAMETER_DOUBLE_ARRAY of floats.
+        """
+        params = []
+        for name, value in values.items():
+            p = ParameterMsg()
+            p.name = name
+            if isinstance(value, bool):
+                p.value.type = ParameterType.PARAMETER_BOOL
+                p.value.bool_value = value
+            elif isinstance(value, int):
+                p.value.type = ParameterType.PARAMETER_INTEGER
+                p.value.integer_value = value
+            elif isinstance(value, float):
+                p.value.type = ParameterType.PARAMETER_DOUBLE
+                p.value.double_value = value
+            elif isinstance(value, list):
+                p.value.type = ParameterType.PARAMETER_DOUBLE_ARRAY
+                p.value.double_array_value = [float(v) for v in value]
+            else:
+                raise TypeError(f"Unsupported parameter type for {name}: {type(value)}")
+            params.append(p)
+
+        self._call_set_parameters(params)
         # Controller applies parameter updates in its 1 Hz timer callback.
         self.spin_for(1.2)
+
+    def set_control_mode(self, mode: int):
+        self.set_params({"control_mode": mode})
 
     def set_pid_gains(self, kp: Sequence[float], ki: Sequence[float], kd: Sequence[float]):
-        p_kp = ParameterMsg()
-        p_kp.name = "kp"
-        p_kp.value.type = ParameterType.PARAMETER_DOUBLE_ARRAY
-        p_kp.value.double_array_value = list(kp)
-
-        p_ki = ParameterMsg()
-        p_ki.name = "ki"
-        p_ki.value.type = ParameterType.PARAMETER_DOUBLE_ARRAY
-        p_ki.value.double_array_value = list(ki)
-
-        p_kd = ParameterMsg()
-        p_kd.name = "kd"
-        p_kd.value.type = ParameterType.PARAMETER_DOUBLE_ARRAY
-        p_kd.value.double_array_value = list(kd)
-
-        self._call_set_parameters([p_kp, p_ki, p_kd])
-        # Controller applies parameter updates in its 1 Hz timer callback.
-        self.spin_for(1.2)
+        self.set_params({"kp": list(kp), "ki": list(ki), "kd": list(kd)})
 
     def set_manual_depth_setpoint(self, enabled: bool, depth_value: float):
-        p_enable = ParameterMsg()
-        p_enable.name = "manual_setpoint_depth"
-        p_enable.value.type = ParameterType.PARAMETER_BOOL
-        p_enable.value.bool_value = enabled
-
-        p_depth = ParameterMsg()
-        p_depth.name = "setpoint_depth"
-        p_depth.value.type = ParameterType.PARAMETER_DOUBLE
-        p_depth.value.double_value = depth_value
-
-        self._call_set_parameters([p_enable, p_depth])
-        # Controller applies parameter updates in its 1 Hz timer callback.
-        self.spin_for(1.2)
+        self.set_params({"manual_setpoint_depth": enabled, "setpoint_depth": depth_value})
 
     def publish_imu(self, w: float, x: float, y: float, z: float):
         msg = Imu()
@@ -131,10 +136,10 @@ class NereoControllerTester(Node):
         msg.orientation.z = z
         self.imu_pub.publish(msg)
 
-    def publish_pressure(self, pressure_pa: float):
-        msg = FluidPressure()
-        msg.fluid_pressure = pressure_pa
-        self.pressure_pub.publish(msg)
+    def publish_depth(self, depth_m: float):
+        msg = Float32()
+        msg.data = depth_m
+        self.depth_pub.publish(msg)
 
     def publish_cmd_vel(self, surge: float, sway: float, heave: float, roll: float, pitch: float, yaw: float):
         msg = CommandVelocity()
@@ -165,7 +170,7 @@ class NereoControllerTester(Node):
 
     def _prime_sensors(self):
         self.publish_imu(1.0, 0.0, 0.0, 0.0)
-        self.publish_pressure(101325.0)
+        self.publish_depth(0.0)
         self.spin_for(0.2)
 
     def test_passthrough(self):
@@ -182,7 +187,7 @@ class NereoControllerTester(Node):
         self.set_control_mode(1)
 
         self.publish_imu(1.0, 0.0, 0.0, 0.0)
-        self.publish_pressure(101325.0)
+        self.publish_depth(0.0)
         self.spin_for(0.2)
 
         # First command updates setpoint to current roll (0 rad).
@@ -195,40 +200,50 @@ class NereoControllerTester(Node):
 
         self._assert_true(out.cmd_vel[3] < -0.03, f"roll correction should be negative, got {out.cmd_vel[3]:.4f}")
 
-    def test_pid_depth_feedback_on_heave(self):
-        self.set_pid_gains([1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0])
-        self.set_control_mode(1)
-        self.set_manual_depth_setpoint(True, 101325.0)
+    def test_depth_metres_heave(self):
+        # D-07/DEPTH-08: known Kp and known metre error give a known heave
+        # command, with the sign pinned by the Task 1 decision (HEAVE_SIGN).
+        # setpoint_depth 1.0 is unique in this suite so the controller's
+        # setpoint-change reset starts this test from zero PID state.
+        self.set_params({
+            "kp": [0.5, 0.0, 0.0, 0.0],
+            "ki": [0.0, 0.0, 0.0, 0.0],
+            "kd": [0.0, 0.0, 0.0, 0.0],
+            "control_mode": 1,
+            "manual_setpoint_depth": True,
+            "setpoint_depth": 1.0,
+        })
 
         try:
             self.publish_imu(1.0, 0.0, 0.0, 0.0)
-            self.publish_pressure(101325.0)
+
+            self.publish_depth(1.0)
             self.spin_for(0.2)
-            self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            self._assert_close(out.cmd_vel[2], 0.0, 0.005, "heave at setpoint")
 
-            # Increase pressure: depth error should produce negative heave correction.
-            self.publish_pressure(104325.0)
-            self.spin_for(0.25)
+            self.publish_depth(1.4)
+            self.spin_for(0.2)
+            out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            self._assert_close(
+                out.cmd_vel[2], HEAVE_SIGN * 0.2, 0.005, "heave when deeper than setpoint"
+            )
 
-            min_heave = 0.0
-            for _ in range(3):
-                out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-                min_heave = min(min_heave, out.cmd_vel[2])
-                self.spin_for(0.1)
-
-            self._assert_true(
-                min_heave < -0.05,
-                f"heave correction should be negative after pressure increase, min observed={min_heave:.4f}",
+            self.publish_depth(0.6)
+            self.spin_for(0.2)
+            out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            self._assert_close(
+                out.cmd_vel[2], -HEAVE_SIGN * 0.2, 0.005, "heave when shallower than setpoint"
             )
         finally:
-            self.set_manual_depth_setpoint(False, 0.0)
+            self.set_params({"manual_setpoint_depth": False})
 
     def test_setpoint_update_on_zero_command(self):
         self.set_pid_gains([0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0])
         self.set_control_mode(1)
 
         self.publish_imu(1.0, 0.0, 0.0, 0.0)
-        self.publish_pressure(101325.0)
+        self.publish_depth(0.0)
         self.spin_for(0.2)
 
         # Keep a non-zero roll command: setpoint should not update.
@@ -261,7 +276,7 @@ def main() -> int:
     tests = [
         ("passthrough", tester.test_passthrough),
         ("pid_roll_correction", tester.test_pid_roll_correction),
-        ("pid_depth_feedback_on_heave", tester.test_pid_depth_feedback_on_heave),
+        ("depth_metres_heave", tester.test_depth_metres_heave),
         ("setpoint_update_on_zero_command", tester.test_setpoint_update_on_zero_command),
     ]
 

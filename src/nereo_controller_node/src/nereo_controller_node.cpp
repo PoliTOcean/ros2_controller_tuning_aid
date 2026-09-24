@@ -2,7 +2,7 @@
 #include "rclcpp/qos.hpp"
 #include "nereo_interfaces/msg/command_velocity.hpp"
 #include "sensor_msgs/msg/imu.hpp"
-#include "sensor_msgs/msg/fluid_pressure.hpp"
+#include "std_msgs/msg/float32.hpp"
 #include "std_msgs/msg/float64_multi_array.hpp"
 #include <cmath>
 #include <array>
@@ -113,6 +113,7 @@ public:
         this->declare_parameter("manual_setpoint_roll", false);
         this->declare_parameter("manual_setpoint_pitch", false);
         this->declare_parameter("manual_setpoint_yaw", false);
+        // Metres, same frame as /barometer_depth (positive down).
         this->declare_parameter("setpoint_depth", 0.0);
         this->declare_parameter("setpoint_roll", 0.0);
         this->declare_parameter("setpoint_pitch", 0.0);
@@ -147,7 +148,7 @@ public:
             "/nereo_cmd_vel_no_fb", 10,
             std::bind(&NereoControllerNode::cmdVelCallback, this, std::placeholders::_1));
             
-        // Sensor data is published by microROS firmware with BEST_EFFORT reliability;
+        // The Pi's sensor nodes publish best-effort via getSensorQoS();
         // match it here, otherwise messages never arrive.
         auto sensor_qos = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort();
 
@@ -155,9 +156,10 @@ public:
             "/imu_data", sensor_qos,
             std::bind(&NereoControllerNode::imuCallback, this, std::placeholders::_1));
 
-        pressure_sub_ = this->create_subscription<sensor_msgs::msg::FluidPressure>(
-            "/barometer_pressure", sensor_qos,
-            std::bind(&NereoControllerNode::pressureCallback, this, std::placeholders::_1));
+        depth_sub_ = this->create_subscription<std_msgs::msg::Float32>(
+            "/barometer_depth", sensor_qos,
+            std::bind(&NereoControllerNode::depthCallback, this,
+                std::placeholders::_1));
             
         // Timer for parameter checking
         param_timer_ = this->create_wall_timer(
@@ -185,7 +187,7 @@ private:
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pid_terms_pub_;
     rclcpp::Subscription<nereo_interfaces::msg::CommandVelocity>::SharedPtr cmd_vel_sub_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
-    rclcpp::Subscription<sensor_msgs::msg::FluidPressure>::SharedPtr pressure_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr depth_sub_;
     rclcpp::TimerBase::SharedPtr param_timer_;
     
     // Control mode and PID controllers
@@ -214,9 +216,9 @@ private:
     
     // Latest sensor data
     Eigen::Quaternionf current_orientation_ = Eigen::Quaternionf::Identity();
-    float current_pressure_ = 0.0f;
+    float current_depth_m_ = 0.0f;
     bool has_orientation_ = false;
-    bool has_pressure_ = false;
+    bool has_depth_ = false;
     
     void checkParameters() {
         // Check if control mode parameter has changed
@@ -436,18 +438,25 @@ private:
         msg->orientation.w, msg->orientation.x, msg->orientation.y, msg->orientation.z);
     }
 
-    void pressureCallback(const sensor_msgs::msg::FluidPressure::SharedPtr msg) {
-        current_pressure_ = msg->fluid_pressure;
-        has_pressure_ = true;
-        RCLCPP_DEBUG(this->get_logger(), "Pressure data received: %.2f Pa", msg->fluid_pressure);
+    void depthCallback(const std_msgs::msg::Float32::SharedPtr msg) {
+        if (!std::isfinite(msg->data)) {
+            has_depth_ = false;
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "Non-finite depth received, treating depth as missing");
+            return;
+        }
+        current_depth_m_ = msg->data;
+        has_depth_ = true;
+        RCLCPP_DEBUG(this->get_logger(),
+            "Depth data received: %.2f m", msg->data);
     }
-    
+
     void cmdVelCallback(const nereo_interfaces::msg::CommandVelocity::SharedPtr msg) {
-        if (!has_orientation_ || !has_pressure_) {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
-                "Missing sensor data (orientation: %s, pressure: %s)", 
-                has_orientation_ ? "true" : "false", 
-                has_pressure_ ? "true" : "false");
+        if (!has_orientation_ || !has_depth_) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "Missing sensor data (orientation: %s, depth: %s)",
+                has_orientation_ ? "true" : "false",
+                has_depth_ ? "true" : "false");
             
             // Pass through the command velocity without modification
             cmd_vel_pub_->publish(*msg);
@@ -584,7 +593,7 @@ private:
             
             if (x_condition && y_condition && z_condition) {
                 if (last_cmd_vel_neq_0_[0]) {
-                    setpoints_[0] = current_pressure_;
+                    setpoints_[0] = current_depth_m_;
                     count++;
                     //reset PID state for this axis to avoid derivative kick and integral windup
                     pids_[0].reset();
@@ -610,7 +619,7 @@ private:
         }
         
         if (first_update_) {
-            if (!manual_setpoint_[0]) setpoints_[0] = current_pressure_;
+            if (!manual_setpoint_[0]) setpoints_[0] = current_depth_m_;
             if (!manual_setpoint_[1]) setpoints_[1] = rpy_rads[0];
             if (!manual_setpoint_[2]) setpoints_[2] = rpy_rads[1];
             if (!manual_setpoint_[3]) setpoints_[3] = rpy_rads[2];
@@ -631,14 +640,23 @@ private:
         while (angle < -M_PI) angle += 2 * M_PI;
         return angle;
     }
-    
+
+    // Depth and setpoint are metres, positive down, in the tare-relative
+    // frame of /barometer_depth. Task 1 decision (option A): a positive
+    // cmd_vel[2] ascends, so a vehicle deeper than its setpoint
+    // (current_depth_m_ > setpoints_[0]) must yield a positive error, which
+    // the PID turns into a positive (ascending) heave correction.
+    float depthError() const {
+        return current_depth_m_ - setpoints_[0];
+    }
+
     void calculateFeedbackWithPid(const std::array<float, 6>& cmd_vel, std::array<float, 6>& output_cmd_vel) {
         // Calculate current values (z, roll, pitch, yaw)
         std::array<float, 4> current_values;
         std::array<float, 3> rpy_rads;
         calculateRpyFromQuaternion(current_orientation_, rpy_rads);
-        
-        current_values[0] = current_pressure_;
+
+        current_values[0] = current_depth_m_;
         current_values[1] = rpy_rads[0];  // roll
         current_values[2] = rpy_rads[1];  // pitch
         current_values[3] = rpy_rads[2];  // yaw
@@ -655,7 +673,7 @@ private:
         float pitch_error = wrap_phase(setpoints_[2] - current_values[2]);
 
         // Keep debug publisher aligned with the exact errors sent to PID.
-        float z_error = (setpoints_[0] - current_values[0])/100.0f;
+        float z_error = depthError();
         pid_input_errors_ = {z_error, roll_error, pitch_error, yaw_error};
 
         float roll_p = 0.0f, roll_i = 0.0f, roll_d = 0.0f;
@@ -711,22 +729,22 @@ private:
         std::array<float, 4> current_values;
         std::array<float, 3> rpy_rads;
         calculateRpyFromQuaternion(current_orientation_, rpy_rads);
-        
-        current_values[0] = current_pressure_;
+
+        current_values[0] = current_depth_m_;
         current_values[1] = rpy_rads[0];  // roll
         current_values[2] = rpy_rads[1];  // pitch
         current_values[3] = rpy_rads[2];  // yaw
-        
+
         updateSetpoints(cmd_vel);
-        
+
         // Copy input to output
         output_cmd_vel = cmd_vel;
-        
+
         // Calculate PID outputs with anti-windup
         float roll_error  = wrap_phase(setpoints_[1] - current_values[1]);
         float pitch_error = wrap_phase(setpoints_[2] - current_values[2]);
         float yaw_error   = wrap_phase(setpoints_[3] - current_values[3]);
-        float z_error = (setpoints_[0] - current_values[0]) / 100.0f;
+        float z_error = depthError();
 
         pid_input_errors_ = {z_error, roll_error, pitch_error, yaw_error};
 
@@ -786,19 +804,24 @@ private:
         std::array<float, 3> rpy_rads;
         calculateRpyFromQuaternion(current_orientation_, rpy_rads);
         
-        current_values[0] = current_pressure_;
+        current_values[0] = current_depth_m_;
         current_values[1] = rpy_rads[0];  // roll
         current_values[2] = rpy_rads[1];  // pitch
         current_values[3] = rpy_rads[2];  // yaw
-        
+
         updateSetpoints(cmd_vel);
-        
+
         // Copy input to output
         output_cmd_vel = cmd_vel;
-        
-        // Heave control (depth) using CS controller
-        float heave_measurements[2] = {current_pressure_, 0.0f};  // Only using position for now
-        float heave_correction = controllers_[0].calculateU(setpoints_[0], current_pressure_, heave_measurements);
+
+        // Heave control (depth) using CS controller. This path now
+        // receives metres but is not re-commissioned this phase (gains
+        // ship at zero); its internal error sign has not been checked
+        // against the heave convention used by depthError().
+        // Only using position for now.
+        float heave_measurements[2] = {current_depth_m_, 0.0f};
+        float heave_correction = controllers_[0].calculateU(
+            setpoints_[0], current_depth_m_, heave_measurements);
         
         // Roll control using CS controller
         float roll_measurements[2] = {rpy_rads[0], 0.0f};  // Only using position for now
