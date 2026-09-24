@@ -2,15 +2,18 @@
 
 ### Launch the Node
 
-Puoi lanciare il nodo e, opzionalmente, impostare i parametri `control_mode`, `kp`, `ki`, `kd` e i parametri del CS Controller direttamente dal comando di launch:
+Puoi lanciare il nodo impostando `control_mode` e, opzionalmente, un file di
+parametri diverso da quello installato (D-03: `kp`, `ki`, `kd`,
+`anti_windup_gains`, `authority_cap` e i parametri del CS Controller vivono
+tutti nella YAML, non più come argomenti di launch separati):
 
 ```sh
-ros2 launch nereo_controller_node nereo_controller.launch.py control_mode:=<valore> kp:="[<valori>]" ki:="[<valori>]" kd:="[<valori>]" cs_kx0:="[<v1>, <v2>]" cs_ki0:=<val> cs_heave_min:=<val> cs_heave_max:=<val>
+ros2 launch nereo_controller_node nereo_controller.launch.py control_mode:=<valore> params_file:=<path/al/file.yaml>
 ```
 
 Esempio:
 ```sh
-ros2 launch nereo_controller_node nereo_controller.launch.py control_mode:=3 cs_kx0:="[200.0, 470.0]" cs_ki0:=-360.0 cs_heave_min:=-70.0 cs_heave_max:=90.0
+ros2 launch nereo_controller_node nereo_controller.launch.py control_mode:=3 params_file:=/tmp/controller_params.yaml
 ```
 
 ### Launch Node + PID Tuner GUI
@@ -27,9 +30,9 @@ ros2 run nereo_controller_node pid_tuner_gui.py --ros-args -p target_node:=/nere
 
 ### Publish Test Messages
 
-- **Publish Pressure:**
+- **Publish Depth:**
     ```sh
-    ros2 topic pub /barometer_pressure sensor_msgs/msg/FluidPressure "{fluid_pressure: 101325.0}"
+    ros2 topic pub /barometer_depth std_msgs/msg/Float32 "{data: 0.0}"
     ```
 
 - **Publish IMU Data:**
@@ -44,10 +47,19 @@ ros2 run nereo_controller_node pid_tuner_gui.py --ros-args -p target_node:=/nere
 
 ### Check Output
 ```sh
-ros2 topic echo /nereo_cmd_vel
+ros2 topic echo /nereo_cmd_vel_ctrl
 ```
 
 ### Run Automated Integration Tests
+
+I test pubblicano comandi e sensori sintetici sugli stessi topic della
+telemetria reale, quindi vanno eseguiti su un `ROS_DOMAIN_ID` isolato (e
+`ROS_LOCALHOST_ONLY=1`) per non collidere con un banco o un veicolo reale
+sulla stessa rete:
+
+```sh
+export ROS_DOMAIN_ID=90 ROS_LOCALHOST_ONLY=1
+```
 
 Dopo aver avviato il controller, esegui la suite di test automatica:
 
@@ -56,6 +68,13 @@ python3 src/nereo_controller_node/test/test_nereo_controller.py
 ```
 
 Il comando restituisce `0` se tutti i test passano, `1` se almeno un test fallisce.
+
+`test_params_file.py` (D-03/D-04/D-05) avvia e ferma da solo i propri
+processi controller, quindi non richiede un nodo già in esecuzione:
+
+```sh
+python3 src/nereo_controller_node/test/test_params_file.py
+```
 
 ### Set Parameters
 
