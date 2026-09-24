@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""04-05 Task 1: proves the committed params YAML loads through launch into
-the running controller, and that a malformed gains array fails safe to zero
-instead of the old non-zero 0.1/0.01/0.05 fallback (D-03/D-05, T-04-21)."""
+"""04-05: proves the committed params YAML loads through launch into the
+running controller and that a malformed gains array fails safe to zero
+(Task 1), and that the tuner's write_params_file() writes exactly the D-03
+key set through the resolved path (Task 2)."""
 
+import importlib.util
 import os
 import signal
 import subprocess
@@ -13,6 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Sequence
 
 import rclpy
+import yaml
 from ament_index_python.packages import get_package_prefix
 from rcl_interfaces.msg import ParameterType
 from rcl_interfaces.srv import GetParameters
@@ -104,6 +107,19 @@ def _stop_node(proc: subprocess.Popen, timeout: float = 10.0) -> None:
         proc.wait(timeout=5.0)
 
 
+def _load_pid_tuner_gui_module():
+    """Import pid_tuner_gui.py by path (it lives in scripts/, not on the
+    package's normal import path). Importing it does not create a Tk
+    window -- PidTunerGui() is only instantiated in main()."""
+    script_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "pid_tuner_gui.py"
+    )
+    spec = importlib.util.spec_from_file_location("pid_tuner_gui", script_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _write_malformed_params(path: str) -> None:
     # kp is malformed (3 elements, not PID_NUMBER=4); every other
     # persisted array is valid so only the kp size trips the fail-safe.
@@ -169,6 +185,106 @@ def test_malformed_gains_fail_safe_to_zero(tester: NereoControllerTester) -> Non
         _stop_node(proc)
 
 
+def test_tuner_writer_round_trip(tester: NereoControllerTester) -> None:
+    pid_tuner_gui = _load_pid_tuner_gui_module()
+    tmp_dir = tempfile.mkdtemp()
+    params_file = os.path.join(tmp_dir, "params.yaml")
+
+    values = {
+        "kp": [0.5, 0.0, 0.0, 0.0],
+        "ki": [0.0, 0.0, 0.0, 0.0],
+        "kd": [0.0, 0.0, 0.0, 0.0],
+        "anti_windup_gains": [0.5, 1.0, 1.0, 1.0],
+        "authority_cap": 1,  # int on purpose: must round-trip as a ROS double
+        "cs_kx0": [0.0, 0.0],
+        "cs_kx1": [0.0, 0.0],
+        "cs_kx2": [0.0, 0.0],
+        "cs_ki0": 0.0,
+        "cs_ki1": 0.0,
+        "cs_ki2": 0.0,
+        "cs_heave_min": 0.0,
+        "cs_heave_max": 0.0,
+        "cs_angle_min": 0.0,
+        "cs_angle_max": 0.0,
+    }
+
+    pid_tuner_gui.write_params_file(params_file, "/nereo_controller_node", values)
+
+    text = Path(params_file).read_text()
+    NereoControllerTester._assert_true(
+        "control_mode" not in text, "written file must not contain control_mode"
+    )
+    NereoControllerTester._assert_true(
+        "manual_setpoint" not in text, "written file must not contain manual_setpoint"
+    )
+
+    proc = _start_node_with_params(params_file)
+    try:
+        loaded = get_params(tester, ["kp", "anti_windup_gains", "authority_cap"])
+        NereoControllerTester._assert_close(loaded["kp"][0], 0.5, 0.001, "kp[0] round trip")
+        NereoControllerTester._assert_close(
+            loaded["anti_windup_gains"][0], 0.5, 0.001, "anti_windup_gains[0] round trip"
+        )
+        NereoControllerTester._assert_close(
+            loaded["authority_cap"], 1.0, 0.001, "authority_cap round trip"
+        )
+        NereoControllerTester._assert_true(
+            isinstance(loaded["authority_cap"], float),
+            f"authority_cap should decode as PARAMETER_DOUBLE, got {type(loaded['authority_cap'])}",
+        )
+    finally:
+        _stop_node(proc)
+
+
+def test_writer_rejects_missing_key(tester: NereoControllerTester) -> None:
+    pid_tuner_gui = _load_pid_tuner_gui_module()
+    tmp_dir = tempfile.mkdtemp()
+    params_file = os.path.join(tmp_dir, "params.yaml")
+
+    values = {}
+    for name in pid_tuner_gui.PERSISTED_PARAMS:
+        if name == "authority_cap":
+            continue  # the missing key under test
+        if name in ("kp", "ki", "kd", "anti_windup_gains"):
+            values[name] = [0.0, 0.0, 0.0, 0.0]
+        elif name in ("cs_kx0", "cs_kx1", "cs_kx2"):
+            values[name] = [0.0, 0.0]
+        else:
+            values[name] = 0.0
+
+    raised = False
+    try:
+        pid_tuner_gui.write_params_file(params_file, "/nereo_controller_node", values)
+    except KeyError:
+        raised = True
+    NereoControllerTester._assert_true(raised, "a missing authority_cap should raise KeyError")
+    NereoControllerTester._assert_true(
+        not os.path.exists(params_file), "no file should be written on a missing key"
+    )
+
+
+def test_shipped_yaml_matches_writer(tester: NereoControllerTester) -> None:
+    pid_tuner_gui = _load_pid_tuner_gui_module()
+    shipped_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "config", "controller_params.yaml"
+    )
+    shipped_text = Path(shipped_path).read_text()
+
+    with open(shipped_path) as f:
+        loaded = yaml.safe_load(f)
+    values = loaded["/nereo_controller_node"]["ros__parameters"]
+
+    tmp_dir = tempfile.mkdtemp()
+    rewritten_path = os.path.join(tmp_dir, "controller_params.yaml")
+    pid_tuner_gui.write_params_file(rewritten_path, "/nereo_controller_node", values)
+
+    rewritten_text = Path(rewritten_path).read_text()
+    NereoControllerTester._assert_true(
+        rewritten_text == shipped_text,
+        "write_params_file output must be byte-identical to the shipped YAML",
+    )
+
+
 def main() -> int:
     rclpy.init()
     tester = NereoControllerTester()
@@ -179,6 +295,9 @@ def main() -> int:
             "test_malformed_gains_fail_safe_to_zero",
             lambda: test_malformed_gains_fail_safe_to_zero(tester),
         ),
+        ("test_tuner_writer_round_trip", lambda: test_tuner_writer_round_trip(tester)),
+        ("test_writer_rejects_missing_key", lambda: test_writer_rejects_missing_key(tester)),
+        ("test_shipped_yaml_matches_writer", lambda: test_shipped_yaml_matches_writer(tester)),
     ]
 
     results: List[TestResult] = []
