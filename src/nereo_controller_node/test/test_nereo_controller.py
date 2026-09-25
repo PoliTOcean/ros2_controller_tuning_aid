@@ -11,7 +11,16 @@ from rcl_interfaces.msg import Parameter as ParameterMsg
 from rcl_interfaces.msg import ParameterType
 from rcl_interfaces.srv import SetParameters
 from rclpy.node import Node
-from sensor_msgs.msg import FluidPressure, Imu
+from sensor_msgs.msg import Imu
+from std_msgs.msg import Float32
+
+# Task 1 decision (2026-09-24, operator): positive heave ascends. This
+# matches the joystick mapping (right stick up -> +cmd_vel[2]), the web
+# joystick's "up -> positive heave" comment, and the bench-verified
+# vertical thruster rows. The controller's depthError() is therefore
+# current_depth_m_ - setpoints_[0]: a vehicle deeper than its setpoint
+# gets a positive (ascending) heave correction.
+HEAVE_SIGN = 1
 
 
 @dataclass
@@ -27,10 +36,10 @@ class NereoControllerTester(Node):
 
         self.cmd_vel_pub = self.create_publisher(CommandVelocity, "/nereo_cmd_vel_no_fb", 10)
         self.imu_pub = self.create_publisher(Imu, "/imu_data", 10)
-        self.pressure_pub = self.create_publisher(FluidPressure, "/barometer_pressure", 10)
+        self.depth_pub = self.create_publisher(Float32, "/barometer_depth", 10)
         self.cmd_vel_sub = self.create_subscription(
             CommandVelocity,
-            "/nereo_cmd_vel",
+            "/nereo_cmd_vel_ctrl",
             self.cmd_vel_callback,
             10,
         )
@@ -56,7 +65,7 @@ class NereoControllerTester(Node):
             rclpy.spin_once(self, timeout_sec=0.05)
             if self.response_seq > previous_seq and self.latest_cmd_vel is not None:
                 return self.latest_cmd_vel
-        raise TimeoutError("Timeout waiting for /nereo_cmd_vel response")
+        raise TimeoutError("Timeout waiting for /nereo_cmd_vel_ctrl response")
 
     def _call_set_parameters(self, parameters: Sequence[ParameterMsg]):
         while not self.parameter_client.wait_for_service(timeout_sec=1.0):
@@ -79,49 +88,53 @@ class NereoControllerTester(Node):
                 return
         raise TimeoutError("Timeout waiting for set_parameters response")
 
-    def set_control_mode(self, mode: int):
-        p = ParameterMsg()
-        p.name = "control_mode"
-        p.value.type = ParameterType.PARAMETER_INTEGER
-        p.value.integer_value = mode
-        self._call_set_parameters([p])
+    def set_params(self, values: dict):
+        """Build one SetParameters call from plain Python types and wait
+        for the controller's 1 Hz parameter poll to pick it up.
+
+        bool -> PARAMETER_BOOL, int -> PARAMETER_INTEGER,
+        float -> PARAMETER_DOUBLE, list -> PARAMETER_DOUBLE_ARRAY of floats.
+        """
+        params = []
+        for name, value in values.items():
+            p = ParameterMsg()
+            p.name = name
+            if isinstance(value, bool):
+                p.value.type = ParameterType.PARAMETER_BOOL
+                p.value.bool_value = value
+            elif isinstance(value, int):
+                p.value.type = ParameterType.PARAMETER_INTEGER
+                p.value.integer_value = value
+            elif isinstance(value, float):
+                p.value.type = ParameterType.PARAMETER_DOUBLE
+                p.value.double_value = value
+            elif isinstance(value, list):
+                p.value.type = ParameterType.PARAMETER_DOUBLE_ARRAY
+                p.value.double_array_value = [float(v) for v in value]
+            else:
+                raise TypeError(f"Unsupported parameter type for {name}: {type(value)}")
+            params.append(p)
+
+        self._call_set_parameters(params)
         # Controller applies parameter updates in its 1 Hz timer callback.
         self.spin_for(1.2)
+
+    def set_control_mode(self, mode: int):
+        self.set_params({"control_mode": mode})
 
     def set_pid_gains(self, kp: Sequence[float], ki: Sequence[float], kd: Sequence[float]):
-        p_kp = ParameterMsg()
-        p_kp.name = "kp"
-        p_kp.value.type = ParameterType.PARAMETER_DOUBLE_ARRAY
-        p_kp.value.double_array_value = list(kp)
-
-        p_ki = ParameterMsg()
-        p_ki.name = "ki"
-        p_ki.value.type = ParameterType.PARAMETER_DOUBLE_ARRAY
-        p_ki.value.double_array_value = list(ki)
-
-        p_kd = ParameterMsg()
-        p_kd.name = "kd"
-        p_kd.value.type = ParameterType.PARAMETER_DOUBLE_ARRAY
-        p_kd.value.double_array_value = list(kd)
-
-        self._call_set_parameters([p_kp, p_ki, p_kd])
-        # Controller applies parameter updates in its 1 Hz timer callback.
-        self.spin_for(1.2)
+        self.set_params({"kp": list(kp), "ki": list(ki), "kd": list(kd)})
 
     def set_manual_depth_setpoint(self, enabled: bool, depth_value: float):
-        p_enable = ParameterMsg()
-        p_enable.name = "manual_setpoint_depth"
-        p_enable.value.type = ParameterType.PARAMETER_BOOL
-        p_enable.value.bool_value = enabled
+        self.set_params({"manual_setpoint_depth": enabled, "setpoint_depth": depth_value})
 
-        p_depth = ParameterMsg()
-        p_depth.name = "setpoint_depth"
-        p_depth.value.type = ParameterType.PARAMETER_DOUBLE
-        p_depth.value.double_value = depth_value
-
-        self._call_set_parameters([p_enable, p_depth])
-        # Controller applies parameter updates in its 1 Hz timer callback.
-        self.spin_for(1.2)
+    def _assert_within_cap(self, out: CommandVelocity, pilot: Sequence[float], cap: float, label: str):
+        for i, axis in enumerate(["surge", "sway", "heave", "roll", "pitch", "yaw"]):
+            diff = abs(out.cmd_vel[i] - pilot[i])
+            self._assert_true(
+                diff <= cap + 0.001,
+                f"{label} {axis}: correction {diff:.4f} exceeds cap {cap:.4f}",
+            )
 
     def publish_imu(self, w: float, x: float, y: float, z: float):
         msg = Imu()
@@ -131,10 +144,10 @@ class NereoControllerTester(Node):
         msg.orientation.z = z
         self.imu_pub.publish(msg)
 
-    def publish_pressure(self, pressure_pa: float):
-        msg = FluidPressure()
-        msg.fluid_pressure = pressure_pa
-        self.pressure_pub.publish(msg)
+    def publish_depth(self, depth_m: float):
+        msg = Float32()
+        msg.data = depth_m
+        self.depth_pub.publish(msg)
 
     def publish_cmd_vel(self, surge: float, sway: float, heave: float, roll: float, pitch: float, yaw: float):
         msg = CommandVelocity()
@@ -165,7 +178,7 @@ class NereoControllerTester(Node):
 
     def _prime_sensors(self):
         self.publish_imu(1.0, 0.0, 0.0, 0.0)
-        self.publish_pressure(101325.0)
+        self.publish_depth(0.0)
         self.spin_for(0.2)
 
     def test_passthrough(self):
@@ -182,7 +195,7 @@ class NereoControllerTester(Node):
         self.set_control_mode(1)
 
         self.publish_imu(1.0, 0.0, 0.0, 0.0)
-        self.publish_pressure(101325.0)
+        self.publish_depth(0.0)
         self.spin_for(0.2)
 
         # First command updates setpoint to current roll (0 rad).
@@ -195,40 +208,228 @@ class NereoControllerTester(Node):
 
         self._assert_true(out.cmd_vel[3] < -0.03, f"roll correction should be negative, got {out.cmd_vel[3]:.4f}")
 
-    def test_pid_depth_feedback_on_heave(self):
-        self.set_pid_gains([1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0])
-        self.set_control_mode(1)
-        self.set_manual_depth_setpoint(True, 101325.0)
+    def test_depth_metres_heave(self):
+        # D-07/DEPTH-08: known Kp and known metre error give a known heave
+        # command, with the sign pinned by the Task 1 decision (HEAVE_SIGN).
+        # setpoint_depth 1.0 is unique in this suite so the controller's
+        # setpoint-change reset starts this test from zero PID state.
+        self.set_params({
+            "kp": [0.5, 0.0, 0.0, 0.0],
+            "ki": [0.0, 0.0, 0.0, 0.0],
+            "kd": [0.0, 0.0, 0.0, 0.0],
+            "control_mode": 1,
+            "manual_setpoint_depth": True,
+            "setpoint_depth": 1.0,
+        })
 
         try:
             self.publish_imu(1.0, 0.0, 0.0, 0.0)
-            self.publish_pressure(101325.0)
+
+            self.publish_depth(1.0)
             self.spin_for(0.2)
-            self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            self._assert_close(out.cmd_vel[2], 0.0, 0.005, "heave at setpoint")
 
-            # Increase pressure: depth error should produce negative heave correction.
-            self.publish_pressure(104325.0)
-            self.spin_for(0.25)
+            self.publish_depth(1.4)
+            self.spin_for(0.2)
+            out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            self._assert_close(
+                out.cmd_vel[2], HEAVE_SIGN * 0.2, 0.005, "heave when deeper than setpoint"
+            )
 
-            min_heave = 0.0
-            for _ in range(3):
-                out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-                min_heave = min(min_heave, out.cmd_vel[2])
-                self.spin_for(0.1)
-
-            self._assert_true(
-                min_heave < -0.05,
-                f"heave correction should be negative after pressure increase, min observed={min_heave:.4f}",
+            self.publish_depth(0.6)
+            self.spin_for(0.2)
+            out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            self._assert_close(
+                out.cmd_vel[2], -HEAVE_SIGN * 0.2, 0.005, "heave when shallower than setpoint"
             )
         finally:
-            self.set_manual_depth_setpoint(False, 0.0)
+            self.set_params({"manual_setpoint_depth": False})
+
+    def test_authority_cap(self):
+        # DEPTH-10/D-08: authority_cap bounds only the correction the
+        # controller adds, saturating exactly at the cap, never the
+        # pilot's own command component.
+        self.set_params({
+            "kp": [1.0, 0.0, 0.0, 0.0],
+            "ki": [0.0, 0.0, 0.0, 0.0],
+            "kd": [0.0, 0.0, 0.0, 0.0],
+            "control_mode": 1,
+            "authority_cap": 0.25,
+            "manual_setpoint_depth": True,
+            "setpoint_depth": 0.0,
+        })
+
+        try:
+            self.publish_imu(1.0, 0.0, 0.0, 0.0)
+
+            # Above the cap: saturates.
+            self.publish_depth(2.0)
+            self.spin_for(0.2)
+            out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            self._assert_close(out.cmd_vel[2], HEAVE_SIGN * 0.25, 0.001, "heave saturates above cap")
+            self._assert_within_cap(out, [0.0] * 6, 0.25, "above cap")
+
+            # Exactly at the cap: unchanged.
+            self.publish_depth(0.25)
+            self.spin_for(0.2)
+            out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            self._assert_close(out.cmd_vel[2], HEAVE_SIGN * 0.25, 0.001, "heave exactly at cap")
+            self._assert_within_cap(out, [0.0] * 6, 0.25, "at cap")
+
+            # One step below the cap: unchanged.
+            self.publish_depth(0.2)
+            self.spin_for(0.2)
+            out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            self._assert_close(out.cmd_vel[2], HEAVE_SIGN * 0.2, 0.001, "heave one step below cap")
+            self._assert_within_cap(out, [0.0] * 6, 0.25, "below cap")
+
+            # Pilot authority: surge/sway never carry depth feedback under
+            # an identity orientation, so they pass through unmodified
+            # even while a capped depth correction is active on heave.
+            pilot = [0.9, 0.0, 0.9, 0.0, 0.0, 0.0]
+            out = self.send_and_wait(pilot)
+            self._assert_close(out.cmd_vel[0], 0.9, 0.001, "pilot surge passes through unmodified")
+            self._assert_within_cap(out, pilot, 0.25, "pilot command plus capped correction")
+
+            # Depth back at setpoint: the correction is exactly zero, so
+            # the pilot's own heave command also comes back unmodified.
+            self.publish_depth(0.0)
+            self.spin_for(0.2)
+            out = self.send_and_wait(pilot)
+            self._assert_close(out.cmd_vel[0], 0.9, 0.001, "pilot surge passes through unmodified")
+            self._assert_close(out.cmd_vel[2], 0.9, 0.001, "pilot heave passes through unmodified at zero error")
+
+            # authority_cap 0.0 disables feedback entirely (fail toward
+            # zero authority, never toward more).
+            self.set_params({"authority_cap": 0.0})
+            self.publish_depth(2.0)
+            self.spin_for(0.2)
+            out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            self._assert_close(out.cmd_vel[2], 0.0, 0.001, "authority_cap 0.0 disables feedback")
+
+            # Out-of-range values are rejected by the FloatingPointRange.
+            rejected = False
+            try:
+                self.set_params({"authority_cap": -0.01})
+            except RuntimeError:
+                rejected = True
+            self._assert_true(rejected, "authority_cap -0.01 should be rejected")
+
+            rejected = False
+            try:
+                self.set_params({"authority_cap": 1.01})
+            except RuntimeError:
+                rejected = True
+            self._assert_true(rejected, "authority_cap 1.01 should be rejected")
+        finally:
+            self.set_params({"authority_cap": 1.0, "manual_setpoint_depth": False})
+
+    def test_anti_windup_gains(self):
+        # DEPTH-07/D-06: anti_windup_gains is a validated parameter; the
+        # back-calculation saturates at authority_cap, so gain=1 stops the
+        # integrator from winding past the cap and gain=0 leaves it wound.
+        def run_reversal(gains: Sequence[float]) -> float:
+            self.set_params({
+                "kp": [0.0, 0.0, 0.0, 0.0],
+                "ki": [0.5, 0.0, 0.0, 0.0],
+                "kd": [0.0, 0.0, 0.0, 0.0],
+                "control_mode": 2,
+                "authority_cap": 0.3,
+                "anti_windup_gains": list(gains),
+                "manual_setpoint_depth": True,
+                "setpoint_depth": 2.0,
+            })
+            self.publish_imu(1.0, 0.0, 0.0, 0.0)
+            self.publish_depth(4.0)
+            self.spin_for(0.2)
+
+            out = None
+            for _ in range(5):
+                out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            self._assert_close(
+                out.cmd_vel[2], HEAVE_SIGN * 0.3, 0.001,
+                f"heave saturated at cap before reversal, gains={gains}",
+            )
+
+            self.publish_depth(0.0)
+            self.spin_for(0.2)
+            out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            return out.cmd_vel[2]
+
+        try:
+            heave_with_gain = run_reversal([1.0, 1.0, 1.0, 1.0])
+            self._assert_close(heave_with_gain, -HEAVE_SIGN * 0.3, 0.001, "gain=1 flips sign on reversal")
+
+            heave_without_gain = run_reversal([0.0, 0.0, 0.0, 0.0])
+            self._assert_close(heave_without_gain, HEAVE_SIGN * 0.3, 0.001, "gain=0 keeps integrator wound")
+        finally:
+            self.set_params({
+                "anti_windup_gains": [1.0, 1.0, 1.0, 1.0],
+                "authority_cap": 1.0,
+                "manual_setpoint_depth": False,
+                "control_mode": 0,
+            })
+
+    def test_mode_change_resets_integrator(self):
+        # DEPTH-09: a mode change must zero every integrator and re-capture
+        # non-manual setpoints, so the first cycle after switching modes is
+        # neither wound up nor built on a stale setpoint. setpoint_depth 1.5
+        # is unique in this suite for the same reset-isolation reason as
+        # test_depth_metres_heave.
+        self.set_params({
+            "kp": [0.0, 0.0, 0.0, 0.0],
+            "ki": [0.1, 0.0, 0.0, 0.0],
+            "kd": [0.0, 0.0, 0.0, 0.0],
+            "control_mode": 1,
+            "manual_setpoint_depth": True,
+            "setpoint_depth": 1.5,
+        })
+
+        try:
+            self.publish_imu(1.0, 0.0, 0.0, 0.0)
+            self.publish_depth(2.5)
+            self.spin_for(0.2)
+
+            out = None
+            for _ in range(5):
+                out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            self._assert_true(
+                abs(out.cmd_vel[2]) >= 0.45,
+                f"integrator should have wound up, got heave={out.cmd_vel[2]:.4f}",
+            )
+
+            self.set_params({"control_mode": 2})
+            out = self.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            self._assert_close(
+                out.cmd_vel[2],
+                HEAVE_SIGN * 0.1,
+                0.02,
+                "heave on first cycle after mode change (must not carry windup)",
+            )
+        finally:
+            self.set_params({"manual_setpoint_depth": False, "control_mode": 1})
+
+    def test_invalid_mode_passthrough(self):
+        # An out-of-range control_mode must publish the pilot command
+        # unchanged instead of an uninitialised output array.
+        self.set_params({"control_mode": 7})
+
+        try:
+            self._prime_sensors()
+            cmd = [0.3, -0.2, 0.1, 0.05, -0.05, 0.1]
+            out = self.send_and_wait(cmd)
+            for i, axis in enumerate(["surge", "sway", "heave", "roll", "pitch", "yaw"]):
+                self._assert_close(out.cmd_vel[i], cmd[i], 0.001, f"invalid mode passthrough {axis}")
+        finally:
+            self.set_params({"control_mode": 0})
 
     def test_setpoint_update_on_zero_command(self):
         self.set_pid_gains([0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0])
         self.set_control_mode(1)
 
         self.publish_imu(1.0, 0.0, 0.0, 0.0)
-        self.publish_pressure(101325.0)
+        self.publish_depth(0.0)
         self.spin_for(0.2)
 
         # Keep a non-zero roll command: setpoint should not update.
@@ -246,6 +447,16 @@ class NereoControllerTester(Node):
         self._assert_true(abs(out.cmd_vel[3]) < 0.08, f"roll should be near zero after setpoint update, got {out.cmd_vel[3]:.4f}")
 
 
+def setup_suite(tester: NereoControllerTester):
+    """Suite-wide defaults so per-test parameter sets stay minimal.
+
+    authority_cap defaults to 0.0 (fail toward zero authority, D-08); the
+    pre-04-03 tests assume an unclamped +/-1 feedback range, so the suite
+    opens it back up before any test runs.
+    """
+    tester.set_params({"authority_cap": 1.0, "anti_windup_gains": [1.0, 1.0, 1.0, 1.0]})
+
+
 def run_test_case(tester: NereoControllerTester, name: str, fn) -> TestResult:
     try:
         fn()
@@ -257,11 +468,16 @@ def run_test_case(tester: NereoControllerTester, name: str, fn) -> TestResult:
 def main() -> int:
     rclpy.init()
     tester = NereoControllerTester()
+    setup_suite(tester)
 
     tests = [
         ("passthrough", tester.test_passthrough),
         ("pid_roll_correction", tester.test_pid_roll_correction),
-        ("pid_depth_feedback_on_heave", tester.test_pid_depth_feedback_on_heave),
+        ("depth_metres_heave", tester.test_depth_metres_heave),
+        ("authority_cap", tester.test_authority_cap),
+        ("anti_windup_gains", tester.test_anti_windup_gains),
+        ("mode_change_resets_integrator", tester.test_mode_change_resets_integrator),
+        ("invalid_mode_passthrough", tester.test_invalid_mode_passthrough),
         ("setpoint_update_on_zero_command", tester.test_setpoint_update_on_zero_command),
     ]
 

@@ -16,6 +16,8 @@
   <depend>std_msgs</depend>
   <depend>eigen</depend>
 
+  <exec_depend>python3-yaml</exec_depend>
+
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
 

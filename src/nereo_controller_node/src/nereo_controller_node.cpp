@@ -2,8 +2,10 @@
 #include "rclcpp/qos.hpp"
 #include "nereo_interfaces/msg/command_velocity.hpp"
 #include "sensor_msgs/msg/imu.hpp"
-#include "sensor_msgs/msg/fluid_pressure.hpp"
+#include "std_msgs/msg/float32.hpp"
 #include "std_msgs/msg/float64_multi_array.hpp"
+#include "rcl_interfaces/msg/parameter_descriptor.hpp"
+#include "rcl_interfaces/msg/floating_point_range.hpp"
 #include <cmath>
 #include <array>
 #include <vector>
@@ -108,11 +110,36 @@ public:
         this->declare_parameter("ki", std::vector<double>{0.0, 0.0, 0.0, 0.0});
         this->declare_parameter("kd", std::vector<double>{0.0, 0.0, 0.0, 0.0});
 
+        // Bounds only the correction the controller adds to the pilot
+        // command, never the pilot's own input (D-08). 0 disables
+        // feedback; a missing or malformed value must fail toward 0,
+        // never toward more authority (DEPTH-10).
+        rcl_interfaces::msg::ParameterDescriptor authority_cap_descriptor;
+        authority_cap_descriptor.description =
+            "max |correction| the controller adds to each pilot axis; "
+            "0 disables feedback; applies in modes 1-3";
+        rcl_interfaces::msg::FloatingPointRange authority_cap_range;
+        authority_cap_range.from_value = 0.0;
+        authority_cap_range.to_value = 1.0;
+        authority_cap_range.step = 0.0;
+        authority_cap_descriptor.floating_point_range.push_back(
+            authority_cap_range);
+        this->declare_parameter("authority_cap", 0.0,
+            authority_cap_descriptor);
+
+        // Anti-windup back-calculation gains (D-06); a malformed value
+        // keeps the previous one instead of falling back to a fixed
+        // default, so a bad set_parameters call cannot silently change
+        // behaviour.
+        this->declare_parameter("anti_windup_gains",
+            std::vector<double>{1.0, 1.0, 1.0, 1.0});
+
         // Manual setpoint parameters (per-axis)
         this->declare_parameter("manual_setpoint_depth", false);
         this->declare_parameter("manual_setpoint_roll", false);
         this->declare_parameter("manual_setpoint_pitch", false);
         this->declare_parameter("manual_setpoint_yaw", false);
+        // Metres, same frame as /barometer_depth (positive down).
         this->declare_parameter("setpoint_depth", 0.0);
         this->declare_parameter("setpoint_roll", 0.0);
         this->declare_parameter("setpoint_pitch", 0.0);
@@ -147,7 +174,7 @@ public:
             "/nereo_cmd_vel_no_fb", 10,
             std::bind(&NereoControllerNode::cmdVelCallback, this, std::placeholders::_1));
             
-        // Sensor data is published by microROS firmware with BEST_EFFORT reliability;
+        // The Pi's sensor nodes publish best-effort via getSensorQoS();
         // match it here, otherwise messages never arrive.
         auto sensor_qos = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort();
 
@@ -155,9 +182,10 @@ public:
             "/imu_data", sensor_qos,
             std::bind(&NereoControllerNode::imuCallback, this, std::placeholders::_1));
 
-        pressure_sub_ = this->create_subscription<sensor_msgs::msg::FluidPressure>(
-            "/barometer_pressure", sensor_qos,
-            std::bind(&NereoControllerNode::pressureCallback, this, std::placeholders::_1));
+        depth_sub_ = this->create_subscription<std_msgs::msg::Float32>(
+            "/barometer_depth", sensor_qos,
+            std::bind(&NereoControllerNode::depthCallback, this,
+                std::placeholders::_1));
             
         // Timer for parameter checking
         param_timer_ = this->create_wall_timer(
@@ -169,7 +197,11 @@ public:
         
         // Initialize CS controller
         initControllers();
-        
+
+        // So authority_cap and every other parameter are live before the
+        // first command, instead of waiting for the 1 Hz timer.
+        checkParameters();
+
         // Initialize other variables
         first_update_ = true;
         last_cmd_vel_neq_0_ = {1, 1, 1, 1};
@@ -185,7 +217,7 @@ private:
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr pid_terms_pub_;
     rclcpp::Subscription<nereo_interfaces::msg::CommandVelocity>::SharedPtr cmd_vel_sub_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
-    rclcpp::Subscription<sensor_msgs::msg::FluidPressure>::SharedPtr pressure_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr depth_sub_;
     rclcpp::TimerBase::SharedPtr param_timer_;
     
     // Control mode and PID controllers
@@ -214,9 +246,16 @@ private:
     
     // Latest sensor data
     Eigen::Quaternionf current_orientation_ = Eigen::Quaternionf::Identity();
-    float current_pressure_ = 0.0f;
+    float current_depth_m_ = 0.0f;
     bool has_orientation_ = false;
-    bool has_pressure_ = false;
+    bool has_depth_ = false;
+
+    // Bounds every feedback correction added to the pilot command
+    // (D-08); code default 0.0 so a missing config yields no feedback.
+    float authority_cap_ = 0.0f;
+
+    // Anti-windup back-calculation gains, one per PID axis (D-06).
+    std::array<float, PID_NUMBER> anti_windup_gains_ = {1.0f, 1.0f, 1.0f, 1.0f};
     
     void checkParameters() {
         // Check if control mode parameter has changed
@@ -225,7 +264,23 @@ private:
         
         if (new_mode != control_mode_) {
             control_mode_ = new_mode;
-            RCLCPP_INFO(this->get_logger(), "Control mode changed to: %d", mode);
+            // A mode change must never carry windup or a stale setpoint
+            // into its first cycle: zero every integrator and force the
+            // next updateSetpoints() to re-capture non-manual setpoints.
+            for (size_t i = 0; i < PID_NUMBER; i++) {
+                pids_[i].reset();
+            }
+            for (size_t i = 0; i < controllers_.size(); i++) {
+                controllers_[i].ErrorIntegral = 0.0f;
+            }
+            first_update_ = true;
+            RCLCPP_INFO(this->get_logger(),
+                "Control mode changed to: %d, integrators reset", mode);
+            if (mode < 0 || mode > 3) {
+                RCLCPP_WARN(this->get_logger(),
+                    "Unknown control_mode %d, passing pilot command through",
+                    mode);
+            }
         }
         
         // Check per-axis manual setpoint modes
@@ -276,6 +331,66 @@ private:
                 }
                 RCLCPP_INFO(this->get_logger(), "PID parameters updated");
             }
+        }
+
+        // Authority cap bounds only the feedback correction (D-08); a
+        // non-finite value must fail toward 0.0, never toward 1.0.
+        double raw_cap = this->get_parameter("authority_cap").as_double();
+        float new_cap = static_cast<float>(raw_cap);
+        if (!std::isfinite(new_cap)) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(),
+                10000, "authority_cap is non-finite, using 0.0");
+            new_cap = 0.0f;
+        }
+        if (new_cap != authority_cap_) {
+            authority_cap_ = new_cap;
+            for (size_t i = 0; i < PID_NUMBER; i++) {
+                pids_[i].reset();
+            }
+            RCLCPP_INFO(this->get_logger(), "Authority cap set to %.3f",
+                authority_cap_);
+        }
+
+        // Anti-windup gains (D-06): accepted only with 4 finite values
+        // >= 0; otherwise keep the previous value rather than a fixed
+        // fallback, so a bad set_parameters call cannot silently rewrite
+        // the behaviour of the axes that were not part of the request.
+        auto anti_windup_values =
+            this->get_parameter("anti_windup_gains").as_double_array();
+        bool anti_windup_valid = anti_windup_values.size() == PID_NUMBER;
+        if (anti_windup_valid) {
+            for (size_t i = 0; i < PID_NUMBER; i++) {
+                if (!std::isfinite(anti_windup_values[i]) ||
+                    anti_windup_values[i] < 0.0) {
+                    anti_windup_valid = false;
+                    break;
+                }
+            }
+        }
+        if (anti_windup_valid) {
+            bool anti_windup_changed = false;
+            for (size_t i = 0; i < PID_NUMBER; i++) {
+                if (anti_windup_gains_[i] !=
+                    static_cast<float>(anti_windup_values[i])) {
+                    anti_windup_changed = true;
+                    break;
+                }
+            }
+            if (anti_windup_changed) {
+                for (size_t i = 0; i < PID_NUMBER; i++) {
+                    anti_windup_gains_[i] =
+                        static_cast<float>(anti_windup_values[i]);
+                }
+                for (size_t i = 0; i < PID_NUMBER; i++) {
+                    pids_[i].reset();
+                }
+                RCLCPP_INFO(this->get_logger(), "Anti-windup gains updated");
+            }
+        } else {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(),
+                10000,
+                "anti_windup_gains needs 4 finite values >= 0, "
+                "keeping previous");
         }
 
         // Check if CS controller parameters have changed
@@ -378,11 +493,13 @@ private:
                 pids_[i].reset();
             }
         } else {
-            RCLCPP_WARN(this->get_logger(), "Invalid PID parameters, using defaults");
+            RCLCPP_WARN(this->get_logger(),
+                "Invalid PID parameters (kp/ki/kd need 4 values each): "
+                "all gains set to zero");
             for (size_t i = 0; i < PID_NUMBER; i++) {
-                pids_[i].Kp = 0.1f;
-                pids_[i].Ki = 0.01f;
-                pids_[i].Kd = 0.05f;
+                pids_[i].Kp = 0.0f;
+                pids_[i].Ki = 0.0f;
+                pids_[i].Kd = 0.0f;
                 pids_[i].updateCoefficients();
                 pids_[i].reset();
             }
@@ -436,18 +553,25 @@ private:
         msg->orientation.w, msg->orientation.x, msg->orientation.y, msg->orientation.z);
     }
 
-    void pressureCallback(const sensor_msgs::msg::FluidPressure::SharedPtr msg) {
-        current_pressure_ = msg->fluid_pressure;
-        has_pressure_ = true;
-        RCLCPP_DEBUG(this->get_logger(), "Pressure data received: %.2f Pa", msg->fluid_pressure);
+    void depthCallback(const std_msgs::msg::Float32::SharedPtr msg) {
+        if (!std::isfinite(msg->data)) {
+            has_depth_ = false;
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "Non-finite depth received, treating depth as missing");
+            return;
+        }
+        current_depth_m_ = msg->data;
+        has_depth_ = true;
+        RCLCPP_DEBUG(this->get_logger(),
+            "Depth data received: %.2f m", msg->data);
     }
-    
+
     void cmdVelCallback(const nereo_interfaces::msg::CommandVelocity::SharedPtr msg) {
-        if (!has_orientation_ || !has_pressure_) {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
-                "Missing sensor data (orientation: %s, pressure: %s)", 
-                has_orientation_ ? "true" : "false", 
-                has_pressure_ ? "true" : "false");
+        if (!has_orientation_ || !has_depth_) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "Missing sensor data (orientation: %s, depth: %s)",
+                has_orientation_ ? "true" : "false",
+                has_depth_ ? "true" : "false");
             
             // Pass through the command velocity without modification
             cmd_vel_pub_->publish(*msg);
@@ -464,8 +588,11 @@ private:
             msg->cmd_vel[5]   // yaw
         };
         
-        // Apply feedback based on control mode
-        std::array<float, 6> output_cmd_vel;
+        // Apply feedback based on control mode. Initialised to the pilot
+        // command so a control_mode matching no case below (an
+        // out-of-range value) publishes the pilot command unchanged
+        // instead of uninitialised memory.
+        std::array<float, 6> output_cmd_vel = cmd_vel;
         
         switch (control_mode_) {
             case ControlMode::DIRECT_PASSTHROUGH:
@@ -584,7 +711,7 @@ private:
             
             if (x_condition && y_condition && z_condition) {
                 if (last_cmd_vel_neq_0_[0]) {
-                    setpoints_[0] = current_pressure_;
+                    setpoints_[0] = current_depth_m_;
                     count++;
                     //reset PID state for this axis to avoid derivative kick and integral windup
                     pids_[0].reset();
@@ -610,7 +737,7 @@ private:
         }
         
         if (first_update_) {
-            if (!manual_setpoint_[0]) setpoints_[0] = current_pressure_;
+            if (!manual_setpoint_[0]) setpoints_[0] = current_depth_m_;
             if (!manual_setpoint_[1]) setpoints_[1] = rpy_rads[0];
             if (!manual_setpoint_[2]) setpoints_[2] = rpy_rads[1];
             if (!manual_setpoint_[3]) setpoints_[3] = rpy_rads[2];
@@ -626,19 +753,39 @@ private:
         return value;
     }
 
+    // Bounds only the correction the controller adds; the pilot's own
+    // command in output_cmd_vel is never passed through this (D-08). A
+    // non-finite feedback resolves to 0.0, never to the cap (fail
+    // toward zero authority, DEPTH-10).
+    float capFeedback(float feedback) {
+        if (!std::isfinite(feedback)) {
+            return 0.0f;
+        }
+        return clamp(feedback, -authority_cap_, authority_cap_);
+    }
+
     static float wrap_phase(float angle) {
         while (angle > M_PI) angle -= 2 * M_PI;
         while (angle < -M_PI) angle += 2 * M_PI;
         return angle;
     }
-    
+
+    // Depth and setpoint are metres, positive down, in the tare-relative
+    // frame of /barometer_depth. Task 1 decision (option A): a positive
+    // cmd_vel[2] ascends, so a vehicle deeper than its setpoint
+    // (current_depth_m_ > setpoints_[0]) must yield a positive error, which
+    // the PID turns into a positive (ascending) heave correction.
+    float depthError() const {
+        return current_depth_m_ - setpoints_[0];
+    }
+
     void calculateFeedbackWithPid(const std::array<float, 6>& cmd_vel, std::array<float, 6>& output_cmd_vel) {
         // Calculate current values (z, roll, pitch, yaw)
         std::array<float, 4> current_values;
         std::array<float, 3> rpy_rads;
         calculateRpyFromQuaternion(current_orientation_, rpy_rads);
-        
-        current_values[0] = current_pressure_;
+
+        current_values[0] = current_depth_m_;
         current_values[1] = rpy_rads[0];  // roll
         current_values[2] = rpy_rads[1];  // pitch
         current_values[3] = rpy_rads[2];  // yaw
@@ -655,7 +802,7 @@ private:
         float pitch_error = wrap_phase(setpoints_[2] - current_values[2]);
 
         // Keep debug publisher aligned with the exact errors sent to PID.
-        float z_error = (setpoints_[0] - current_values[0])/100.0f;
+        float z_error = depthError();
         pid_input_errors_ = {z_error, roll_error, pitch_error, yaw_error};
 
         float roll_p = 0.0f, roll_i = 0.0f, roll_d = 0.0f;
@@ -685,48 +832,46 @@ private:
         bool z_condition = std::abs(z_out_RBF.z()) < TOLERANCE || std::abs(output_cmd_vel[2]) < TOLERANCE;
         
         if (x_condition && y_condition && z_condition) {
-            output_cmd_vel[0] += z_out_RBF.x();
-            output_cmd_vel[1] += z_out_RBF.y();
-            output_cmd_vel[2] += z_out_RBF.z();
+            output_cmd_vel[0] += capFeedback(z_out_RBF.x());
+            output_cmd_vel[1] += capFeedback(z_out_RBF.y());
+            output_cmd_vel[2] += capFeedback(z_out_RBF.z());
         }
         
         // Apply roll, pitch, and yaw feedback
         if (std::abs(roll_pid_feedback) < TOLERANCE || std::abs(output_cmd_vel[3]) < TOLERANCE) {
-            output_cmd_vel[3] += roll_pid_feedback;
+            output_cmd_vel[3] += capFeedback(roll_pid_feedback);
         }
 
         if (std::abs(pitch_pid_feedback) < TOLERANCE || std::abs(output_cmd_vel[4]) < TOLERANCE) {
-            output_cmd_vel[4] += pitch_pid_feedback;
+            output_cmd_vel[4] += capFeedback(pitch_pid_feedback);
         }
 
         if (std::abs(yaw_pid_feedback) < TOLERANCE || std::abs(output_cmd_vel[5]) < TOLERANCE) {
-            output_cmd_vel[5] += yaw_pid_feedback;
+            output_cmd_vel[5] += capFeedback(yaw_pid_feedback);
         }
     }
     
     void calculateFeedbackWithPidAntiWindup(const std::array<float, 6>& cmd_vel, std::array<float, 6>& output_cmd_vel) {
-        static const std::array<float, 4> anti_windup_gains = {1.0f, 1.0f, 1.0f, 1.0f};
-        
         // Calculate current values (z, roll, pitch, yaw)
         std::array<float, 4> current_values;
         std::array<float, 3> rpy_rads;
         calculateRpyFromQuaternion(current_orientation_, rpy_rads);
-        
-        current_values[0] = current_pressure_;
+
+        current_values[0] = current_depth_m_;
         current_values[1] = rpy_rads[0];  // roll
         current_values[2] = rpy_rads[1];  // pitch
         current_values[3] = rpy_rads[2];  // yaw
-        
+
         updateSetpoints(cmd_vel);
-        
+
         // Copy input to output
         output_cmd_vel = cmd_vel;
-        
+
         // Calculate PID outputs with anti-windup
         float roll_error  = wrap_phase(setpoints_[1] - current_values[1]);
         float pitch_error = wrap_phase(setpoints_[2] - current_values[2]);
         float yaw_error   = wrap_phase(setpoints_[3] - current_values[3]);
-        float z_error = (setpoints_[0] - current_values[0]) / 100.0f;
+        float z_error = depthError();
 
         pid_input_errors_ = {z_error, roll_error, pitch_error, yaw_error};
 
@@ -736,17 +881,29 @@ private:
         float z_p = 0.0f, z_i = 0.0f, z_d = 0.0f;
 
         float roll_pid_feedback = pids_[1].computeWithTerms(roll_error, roll_p, roll_i, roll_d);
-        pids_[1].state[2] += (clamp(roll_pid_feedback, -1.0f, 1.0f) - roll_pid_feedback) * anti_windup_gains[1];
+        float roll_capped =
+            clamp(roll_pid_feedback, -authority_cap_, authority_cap_);
+        pids_[1].state[2] +=
+            (roll_capped - roll_pid_feedback) * anti_windup_gains_[1];
 
         float pitch_pid_feedback = pids_[2].computeWithTerms(pitch_error, pitch_p, pitch_i, pitch_d);
-        pids_[2].state[2] += (clamp(pitch_pid_feedback, -1.0f, 1.0f) - pitch_pid_feedback) * anti_windup_gains[2];
+        float pitch_capped =
+            clamp(pitch_pid_feedback, -authority_cap_, authority_cap_);
+        pids_[2].state[2] +=
+            (pitch_capped - pitch_pid_feedback) * anti_windup_gains_[2];
 
         float yaw_pid_feedback = pids_[3].computeWithTerms(yaw_error, yaw_p, yaw_i, yaw_d);
-        pids_[3].state[2] += (clamp(yaw_pid_feedback, -1.0f, 1.0f) - yaw_pid_feedback) * anti_windup_gains[3];
+        float yaw_capped =
+            clamp(yaw_pid_feedback, -authority_cap_, authority_cap_);
+        pids_[3].state[2] +=
+            (yaw_capped - yaw_pid_feedback) * anti_windup_gains_[3];
 
         // Depth control with anti-windup
         float z_pid_output = pids_[0].computeWithTerms(z_error, z_p, z_i, z_d);
-        pids_[0].state[2] += (clamp(z_pid_output, -1.0f, 1.0f) - z_pid_output) * anti_windup_gains[0];
+        float z_capped =
+            clamp(z_pid_output, -authority_cap_, authority_cap_);
+        pids_[0].state[2] +=
+            (z_capped - z_pid_output) * anti_windup_gains_[0];
 
         pid_p_terms_ = {z_p, roll_p, pitch_p, yaw_p};
         pid_i_terms_ = {z_i, roll_i, pitch_i, yaw_i};
@@ -763,20 +920,20 @@ private:
         bool z_condition = std::abs(z_out_RBF.z()) < TOLERANCE || std::abs(output_cmd_vel[2]) < TOLERANCE;
         
         if (x_condition && y_condition && z_condition) {
-            output_cmd_vel[0] += z_out_RBF.x();
-            output_cmd_vel[1] += z_out_RBF.y();
-            output_cmd_vel[2] += z_out_RBF.z();
+            output_cmd_vel[0] += capFeedback(z_out_RBF.x());
+            output_cmd_vel[1] += capFeedback(z_out_RBF.y());
+            output_cmd_vel[2] += capFeedback(z_out_RBF.z());
         }
         
         // Apply roll, pitch, and yaw feedback
         if (std::abs(roll_pid_feedback) < TOLERANCE || std::abs(output_cmd_vel[3]) < TOLERANCE) {
-            output_cmd_vel[3] += roll_pid_feedback;
+            output_cmd_vel[3] += capFeedback(roll_pid_feedback);
         }
         if (std::abs(pitch_pid_feedback) < TOLERANCE || std::abs(output_cmd_vel[4]) < TOLERANCE) {
-            output_cmd_vel[4] += pitch_pid_feedback;
+            output_cmd_vel[4] += capFeedback(pitch_pid_feedback);
         }
         if (std::abs(yaw_pid_feedback) < TOLERANCE || std::abs(output_cmd_vel[5]) < TOLERANCE) {
-            output_cmd_vel[5] += yaw_pid_feedback;
+            output_cmd_vel[5] += capFeedback(yaw_pid_feedback);
         }
     }
     
@@ -786,19 +943,24 @@ private:
         std::array<float, 3> rpy_rads;
         calculateRpyFromQuaternion(current_orientation_, rpy_rads);
         
-        current_values[0] = current_pressure_;
+        current_values[0] = current_depth_m_;
         current_values[1] = rpy_rads[0];  // roll
         current_values[2] = rpy_rads[1];  // pitch
         current_values[3] = rpy_rads[2];  // yaw
-        
+
         updateSetpoints(cmd_vel);
-        
+
         // Copy input to output
         output_cmd_vel = cmd_vel;
-        
-        // Heave control (depth) using CS controller
-        float heave_measurements[2] = {current_pressure_, 0.0f};  // Only using position for now
-        float heave_correction = controllers_[0].calculateU(setpoints_[0], current_pressure_, heave_measurements);
+
+        // Heave control (depth) using CS controller. This path now
+        // receives metres but is not re-commissioned this phase (gains
+        // ship at zero); its internal error sign has not been checked
+        // against the heave convention used by depthError().
+        // Only using position for now.
+        float heave_measurements[2] = {current_depth_m_, 0.0f};
+        float heave_correction = controllers_[0].calculateU(
+            setpoints_[0], current_depth_m_, heave_measurements);
         
         // Roll control using CS controller
         float roll_measurements[2] = {rpy_rads[0], 0.0f};  // Only using position for now
@@ -828,22 +990,22 @@ private:
         bool z_condition = std::abs(z_out_RBF.z()) < TOLERANCE || std::abs(output_cmd_vel[2]) < TOLERANCE;
         
         if (x_condition && y_condition && z_condition) {
-            output_cmd_vel[0] += z_out_RBF.x();
-            output_cmd_vel[1] += z_out_RBF.y();
-            output_cmd_vel[2] += z_out_RBF.z();
+            output_cmd_vel[0] += capFeedback(z_out_RBF.x());
+            output_cmd_vel[1] += capFeedback(z_out_RBF.y());
+            output_cmd_vel[2] += capFeedback(z_out_RBF.z());
         }
         
         // Apply roll, pitch, and yaw feedback
         if (std::abs(roll_correction) < TOLERANCE || std::abs(output_cmd_vel[3]) < TOLERANCE) {
-            output_cmd_vel[3] += roll_correction;
+            output_cmd_vel[3] += capFeedback(roll_correction);
         }
         
         if (std::abs(pitch_correction) < TOLERANCE || std::abs(output_cmd_vel[4]) < TOLERANCE) {
-            output_cmd_vel[4] += pitch_correction;
+            output_cmd_vel[4] += capFeedback(pitch_correction);
         }
         
         if (std::abs(yaw_pid_feedback) < TOLERANCE || std::abs(output_cmd_vel[5]) < TOLERANCE) {
-            output_cmd_vel[5] += yaw_pid_feedback;
+            output_cmd_vel[5] += capFeedback(yaw_pid_feedback);
         }
         
         RCLCPP_DEBUG(this->get_logger(), "CS Controller outputs: Heave: %.2f, Roll: %.2f, Pitch: %.2f, Yaw: %.2f",

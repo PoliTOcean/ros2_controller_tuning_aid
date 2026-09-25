@@ -16,9 +16,10 @@ The core control algorithms are reused from [`nereo_FC_firmware`](https://github
 4. [Run](#run)
 5. [Control modes](#control-modes)
 6. [Parameters](#parameters)
-7. [Topics](#topics)
-8. [Tuning from the GUI](#tuning-from-the-gui)
-9. [Troubleshooting](#troubleshooting)
+7. [Saved gains](#saved-gains)
+8. [Topics](#topics)
+9. [Tuning from the GUI](#tuning-from-the-gui)
+10. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -80,9 +81,15 @@ rosdep install --from-paths src --ignore-src -r -y
 ## Build
 
 ```bash
-colcon build && source install/setup.zsh
+colcon build --symlink-install && source install/setup.zsh
 ```
 
+> Build with `--symlink-install` so the tuner's **Salva YAML** button writes to
+> `src/nereo_controller_node/config/controller_params.yaml` — the file tracked
+> in git — instead of a copy under `install/` that the next plain `colcon
+> build` would silently overwrite. If this overlay was already built without
+> the flag, remove `build/` and `install/` once and rebuild with it.
+>
 > When this overlay is built **before** launching `gui_pkg/workstation.launch.py`, the workstation launch file finds the controller automatically — no manual `source` of this workspace is needed at run time.
 
 ---
@@ -95,11 +102,18 @@ colcon build && source install/setup.zsh
 ros2 launch nereo_controller_node nereo_controller.launch.py
 ```
 
-With initial mode (0 passthrough / 1 PID / 2 PID-AW / 3 CS):
+With an initial mode (0 passthrough / 1 PID / 2 PID-AW / 3 CS) and/or a
+non-default params file:
 
 ```bash
-ros2 launch nereo_controller_node nereo_controller.launch.py control_mode:=2
+ros2 launch nereo_controller_node nereo_controller.launch.py control_mode:=2 params_file:=/path/to/controller_params.yaml
 ```
+
+`params_file` defaults to the installed `config/controller_params.yaml`
+(D-03) and carries `kp`/`ki`/`kd`, `anti_windup_gains`, `authority_cap` and
+the `cs_*` gains. The per-gain and per-CS launch arguments from earlier
+versions of this launch file are gone — edit the YAML by hand or with the
+tuner's **Salva YAML** button instead.
 
 ### Standalone with the legacy PyQt5 tuner
 
@@ -139,16 +153,42 @@ All parameters are runtime-tunable via `ros2 param set` or the TUNER GUI.
 | Name | Type | Notes |
 |---|---|---|
 | `control_mode` | `int` | 0–3, see [Control modes](#control-modes) |
-| `kp`, `ki`, `kd` | `double[4]` | PID gains, ordered `[depth, roll, pitch, yaw]` |
+| `kp`, `ki`, `kd` | `double[4]` | PID gains, ordered `[depth, roll, pitch, yaw]`; ship at zero (D-05) |
+| `anti_windup_gains` | `double[4]` | Back-calculation gain per axis, ordered `[depth, roll, pitch, yaw]`; default `1.0`; needs 4 finite values >= 0, `0` disables back-calculation on that axis |
+| `authority_cap` | `double` | `0`–`1`; clamps only the correction the controller adds to the pilot's command on each axis (also the mode-2 back-calculation limit); code default `0.0` (no feedback), the shipped YAML uses `0.25` |
 | `manual_setpoint_depth/roll/pitch/yaw` | `bool` | When `true`, axis uses `setpoint_*` instead of tracking the current value |
-| `setpoint_depth` | `double` | **Pa** (raw barometer pressure). GUI sends it converted from metres (ρ=1025) |
+| `setpoint_depth` | `double` | **metres**, positive down, same frame as `/barometer_depth`. Positive heave ascends (operator-confirmed sign, 04-02) |
 | `setpoint_roll/pitch/yaw` | `double` | **radians**. GUI sends them converted from degrees |
 | `cs_kx0`, `cs_kx1`, `cs_kx2` | `double[2]` | State feedback gains for heave / roll / pitch |
 | `cs_ki0`, `cs_ki1`, `cs_ki2` | `double` | Integral gains for the CS controller |
 | `cs_heave_min`, `cs_heave_max` | `double` | Saturation limits — heave |
 | `cs_angle_min`, `cs_angle_max` | `double` | Saturation limits — roll / pitch |
 
-> **Unit conventions:** the controller works internally in radians and Pascals. The Nereo dashboard converts setpoints to/from degrees and metres so the operator never sees raw radians. If you set parameters directly from the CLI you must use raw units.
+> **Unit conventions:** the controller works internally in radians for
+> roll/pitch/yaw and metres for depth (no Pascal conversion since 04-02). The
+> Nereo dashboard converts angle setpoints to/from degrees; `setpoint_depth`
+> passes through in metres end to end. If you set parameters directly from
+> the CLI, angles are in radians and depth is in metres.
+
+---
+
+## Saved gains
+
+`config/controller_params.yaml` — installed to the package share and loaded
+by `nereo_controller.launch.py`'s `params_file` argument (D-03) — is the one
+place tuning survives a restart and stays reviewable in git. It holds
+exactly the D-03 key set: `kp`, `ki`, `kd`, `anti_windup_gains`,
+`authority_cap` and the eleven `cs_*` parameters. It deliberately never
+holds `control_mode` or any `manual_setpoint_*`/`setpoint_*` value, so a
+restart always boots into passthrough instead of a stale manual depth
+setpoint or straight into an active control mode.
+
+Depth and attitude gains ship at **zero** (D-05) — there is no hand-derived
+seed; they are found empirically with the tuner in a wet session. The
+tuner's **Salva YAML** button writes the live parameter values it just read
+from the node back to this file, through the resolved path (so a
+`--symlink-install` build updates the tracked source file, not a stale copy
+under `install/`).
 
 ---
 
@@ -160,13 +200,13 @@ All parameters are runtime-tunable via `ros2 param set` or the TUNER GUI.
 |---|---|---|
 | `/nereo_cmd_vel_no_fb` | `nereo_interfaces/CommandVelocity` | `joy_to_cmd_vel` (controller mode) |
 | `/imu_data` | `sensor_msgs/Imu` | `imu_publisher` (RPi) |
-| `/barometer_pressure` | `sensor_msgs/FluidPressure` | `bar_publisher` (RPi) |
+| `/barometer_depth` | `std_msgs/Float32` | `bar_publisher` (RPi); metres, positive down, tare-relative, best-effort |
 
 ### Published
 
 | Topic | Type | Consumer | Purpose |
 |---|---|---|---|
-| `/nereo_cmd_vel` | `nereo_interfaces/CommandVelocity` | `safety_node` / ROV firmware | Final command to the ROV in controller mode |
+| `/nereo_cmd_vel_ctrl` | `nereo_interfaces/CommandVelocity` | `safety_node` | Command after controller feedback; `safety_node` arbitrates the final `/nereo_cmd_vel` sent to the ROV firmware |
 | `/controller/setpoints` | `std_msgs/Float64MultiArray` | TUNER GUI | Live `[depth, roll, pitch, yaw]` setpoints |
 | `/controller/errors` | `std_msgs/Float64MultiArray` | TUNER GUI | Live error vector |
 | `/controller/pid_terms` | `std_msgs/Float64MultiArray` | TUNER GUI | Per-axis P / I / D contributions |
@@ -186,7 +226,7 @@ In the Nereo dashboard, click **TUNER** to open the controller window. You can:
 - Switch `control_mode` from the dropdown
 - Edit `kp / ki / kd` per axis
 - Toggle manual setpoint on/off per axis
-- Set `setpoint_depth` in **metres**, `setpoint_roll/pitch/yaw` in **degrees** (conversion is done in the GUI; the controller stays in Pa/rad)
+- Set `setpoint_depth` in **metres**, `setpoint_roll/pitch/yaw` in **degrees** (angle conversion is done in the GUI; the controller works in metres for depth, radians for angles)
 - Edit the full CS section (`cs_kx0/1/2`, `cs_ki0/1/2`, heave/angle limits)
 - Watch live `/controller/setpoints`, `/controller/errors`, `/controller/pid_terms` at the bottom
 
@@ -200,6 +240,6 @@ Press **RELOAD** to fetch the current parameter values from the node. Press **AP
 |---|---|---|
 | Workstation launch can't find `nereo_controller_node` | Overlay not built or in unexpected path | `colcon build` here; the launch file expects this repo at `~/Documents/PoliTOcean/RD/ros2_controller_tuning_aid` |
 | TUNER shows "DISCONNESSO" | Controller node not running, or parameter services not yet up | Check `ros2 node list` for `/nereo_controller_node`; click RELOAD again |
-| Setpoint values look wrong after RELOAD | GUI converted Pa→m and rad→deg | Expected — for raw values use `ros2 param get /nereo_controller_node setpoint_*` |
 | Controller doesn't react to joystick | Joystick is in *direct* mode | Press the **mode toggle** button on the joystick (Xbox View / DS5 Share) |
 | Controller seems to drift | `manual_setpoint_*` is `false` and the axis is tracking the current value | Enable the manual toggle and set a fixed setpoint, or arm the ROV at the desired pose |
+| Node refuses to start: parameter type | The params YAML has an int where the node expects a double (declared parameter types are strict) | Write every number in the YAML with a decimal point, e.g. `authority_cap: 1.0`, not `1` |

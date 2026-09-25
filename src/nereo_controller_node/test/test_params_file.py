@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""04-05: proves the committed params YAML loads through launch into the
+running controller and that a malformed gains array fails safe to zero
+(Task 1), and that the tuner's write_params_file() writes exactly the D-03
+key set through the resolved path (Task 2)."""
+
+import importlib.util
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Dict, List, Sequence
+
+import rclpy
+import yaml
+from ament_index_python.packages import get_package_prefix
+from rcl_interfaces.msg import ParameterType
+from rcl_interfaces.srv import GetParameters
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from test_nereo_controller import NereoControllerTester, TestResult, run_test_case  # noqa: E402
+
+
+def _decode_value(value):
+    t = value.type
+    if t == ParameterType.PARAMETER_BOOL:
+        return value.bool_value
+    if t == ParameterType.PARAMETER_INTEGER:
+        return value.integer_value
+    if t == ParameterType.PARAMETER_DOUBLE:
+        return value.double_value
+    if t == ParameterType.PARAMETER_STRING:
+        return value.string_value
+    if t == ParameterType.PARAMETER_DOUBLE_ARRAY:
+        return list(value.double_array_value)
+    if t == ParameterType.PARAMETER_INTEGER_ARRAY:
+        return list(value.integer_array_value)
+    if t == ParameterType.PARAMETER_BOOL_ARRAY:
+        return list(value.bool_array_value)
+    return None
+
+
+def get_params(node, names: Sequence[str]) -> Dict[str, object]:
+    """Fetch parameters from /nereo_controller_node's GetParameters
+    service, waiting up to 10 s for the service to become available."""
+    client = node.create_client(GetParameters, "/nereo_controller_node/get_parameters")
+    if not client.wait_for_service(timeout_sec=10.0):
+        raise TimeoutError("Timeout waiting for /nereo_controller_node/get_parameters")
+
+    req = GetParameters.Request()
+    req.names = list(names)
+    future = client.call_async(req)
+
+    end_t = time.time() + 10.0
+    while time.time() < end_t:
+        rclpy.spin_once(node, timeout_sec=0.05)
+        if future.done():
+            result = future.result()
+            if result is None:
+                raise RuntimeError("get_parameters returned no result")
+            return {name: _decode_value(v) for name, v in zip(names, result.values)}
+    raise TimeoutError("Timeout waiting for get_parameters response")
+
+
+def _start_launch() -> subprocess.Popen:
+    return subprocess.Popen(
+        ["ros2", "launch", "nereo_controller_node", "nereo_controller.launch.py"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _stop_launch(proc: subprocess.Popen, timeout: float = 10.0) -> None:
+    if proc.poll() is not None:
+        return
+    proc.send_signal(signal.SIGINT)
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5.0)
+
+
+def _start_node_with_params(params_file: str) -> subprocess.Popen:
+    exe = os.path.join(
+        get_package_prefix("nereo_controller_node"),
+        "lib", "nereo_controller_node", "nereo_controller_node",
+    )
+    return subprocess.Popen(
+        [exe, "--ros-args", "--params-file", params_file],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _stop_node(proc: subprocess.Popen, timeout: float = 10.0) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5.0)
+
+
+def _load_pid_tuner_gui_module():
+    """Import pid_tuner_gui.py by path (it lives in scripts/, not on the
+    package's normal import path). Importing it does not create a Tk
+    window -- PidTunerGui() is only instantiated in main()."""
+    script_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "pid_tuner_gui.py"
+    )
+    spec = importlib.util.spec_from_file_location("pid_tuner_gui", script_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_malformed_params(path: str) -> None:
+    # kp is malformed (3 elements, not PID_NUMBER=4); every other
+    # persisted array is valid so only the kp size trips the fail-safe.
+    Path(path).write_text(
+        "/nereo_controller_node:\n"
+        "  ros__parameters:\n"
+        "    kp: [1.0, 1.0, 1.0]\n"
+        "    ki: [0.0, 0.0, 0.0, 0.0]\n"
+        "    kd: [0.0, 0.0, 0.0, 0.0]\n"
+        "    anti_windup_gains: [1.0, 1.0, 1.0, 1.0]\n"
+        "    authority_cap: 1.0\n"
+    )
+
+
+def test_launch_loads_shipped_yaml(tester: NereoControllerTester) -> None:
+    proc = _start_launch()
+    try:
+        values = get_params(
+            tester, ["kp", "ki", "kd", "anti_windup_gains", "authority_cap", "control_mode"]
+        )
+        NereoControllerTester._assert_true(
+            values["kp"] == [0.0, 0.0, 0.0, 0.0], f"kp: expected [0,0,0,0], got {values['kp']}"
+        )
+        NereoControllerTester._assert_true(
+            values["ki"] == [0.0, 0.0, 0.0, 0.0], f"ki: expected [0,0,0,0], got {values['ki']}"
+        )
+        NereoControllerTester._assert_true(
+            values["kd"] == [0.0, 0.0, 0.0, 0.0], f"kd: expected [0,0,0,0], got {values['kd']}"
+        )
+        NereoControllerTester._assert_true(
+            values["anti_windup_gains"] == [1.0, 1.0, 1.0, 1.0],
+            f"anti_windup_gains: expected [1,1,1,1], got {values['anti_windup_gains']}",
+        )
+        NereoControllerTester._assert_close(values["authority_cap"], 0.25, 0.001, "authority_cap")
+        NereoControllerTester._assert_true(
+            values["control_mode"] == 0, f"control_mode: expected 0, got {values['control_mode']}"
+        )
+    finally:
+        _stop_launch(proc)
+
+
+def test_malformed_gains_fail_safe_to_zero(tester: NereoControllerTester) -> None:
+    tmp_dir = tempfile.mkdtemp()
+    params_file = os.path.join(tmp_dir, "malformed_params.yaml")
+    _write_malformed_params(params_file)
+
+    proc = _start_node_with_params(params_file)
+    try:
+        tester.set_params({
+            "control_mode": 1,
+            "manual_setpoint_depth": True,
+            "setpoint_depth": 0.0,
+        })
+        tester.publish_imu(1.0, 0.0, 0.0, 0.0)
+        tester.publish_depth(1.0)
+        tester.spin_for(0.2)
+        out = tester.send_and_wait([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        NereoControllerTester._assert_close(
+            out.cmd_vel[2], 0.0, 0.001, "heave with a malformed kp array"
+        )
+    finally:
+        tester.set_params({"manual_setpoint_depth": False, "control_mode": 0})
+        _stop_node(proc)
+
+
+def test_tuner_writer_round_trip(tester: NereoControllerTester) -> None:
+    pid_tuner_gui = _load_pid_tuner_gui_module()
+    tmp_dir = tempfile.mkdtemp()
+    params_file = os.path.join(tmp_dir, "params.yaml")
+
+    values = {
+        "kp": [0.5, 0.0, 0.0, 0.0],
+        "ki": [0.0, 0.0, 0.0, 0.0],
+        "kd": [0.0, 0.0, 0.0, 0.0],
+        "anti_windup_gains": [0.5, 1.0, 1.0, 1.0],
+        "authority_cap": 1,  # int on purpose: must round-trip as a ROS double
+        "cs_kx0": [0.0, 0.0],
+        "cs_kx1": [0.0, 0.0],
+        "cs_kx2": [0.0, 0.0],
+        "cs_ki0": 0.0,
+        "cs_ki1": 0.0,
+        "cs_ki2": 0.0,
+        "cs_heave_min": 0.0,
+        "cs_heave_max": 0.0,
+        "cs_angle_min": 0.0,
+        "cs_angle_max": 0.0,
+    }
+
+    pid_tuner_gui.write_params_file(params_file, "/nereo_controller_node", values)
+
+    # The header comment is allowed to *mention* control_mode/manual
+    # setpoints in prose (it explains why they are absent); only the
+    # YAML body (non-comment lines) must never carry those keys.
+    body_lines = [
+        line for line in Path(params_file).read_text().splitlines()
+        if not line.strip().startswith("#")
+    ]
+    body = "\n".join(body_lines)
+    NereoControllerTester._assert_true(
+        "control_mode" not in body, "written file body must not contain control_mode"
+    )
+    NereoControllerTester._assert_true(
+        "manual_setpoint" not in body, "written file body must not contain manual_setpoint"
+    )
+
+    proc = _start_node_with_params(params_file)
+    try:
+        loaded = get_params(tester, ["kp", "anti_windup_gains", "authority_cap"])
+        NereoControllerTester._assert_close(loaded["kp"][0], 0.5, 0.001, "kp[0] round trip")
+        NereoControllerTester._assert_close(
+            loaded["anti_windup_gains"][0], 0.5, 0.001, "anti_windup_gains[0] round trip"
+        )
+        NereoControllerTester._assert_close(
+            loaded["authority_cap"], 1.0, 0.001, "authority_cap round trip"
+        )
+        NereoControllerTester._assert_true(
+            isinstance(loaded["authority_cap"], float),
+            f"authority_cap should decode as PARAMETER_DOUBLE, got {type(loaded['authority_cap'])}",
+        )
+    finally:
+        _stop_node(proc)
+
+
+def test_writer_rejects_missing_key(tester: NereoControllerTester) -> None:
+    pid_tuner_gui = _load_pid_tuner_gui_module()
+    tmp_dir = tempfile.mkdtemp()
+    params_file = os.path.join(tmp_dir, "params.yaml")
+
+    values = {}
+    for name in pid_tuner_gui.PERSISTED_PARAMS:
+        if name == "authority_cap":
+            continue  # the missing key under test
+        if name in ("kp", "ki", "kd", "anti_windup_gains"):
+            values[name] = [0.0, 0.0, 0.0, 0.0]
+        elif name in ("cs_kx0", "cs_kx1", "cs_kx2"):
+            values[name] = [0.0, 0.0]
+        else:
+            values[name] = 0.0
+
+    raised = False
+    try:
+        pid_tuner_gui.write_params_file(params_file, "/nereo_controller_node", values)
+    except KeyError:
+        raised = True
+    NereoControllerTester._assert_true(raised, "a missing authority_cap should raise KeyError")
+    NereoControllerTester._assert_true(
+        not os.path.exists(params_file), "no file should be written on a missing key"
+    )
+
+
+def test_shipped_yaml_matches_writer(tester: NereoControllerTester) -> None:
+    pid_tuner_gui = _load_pid_tuner_gui_module()
+    shipped_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "config", "controller_params.yaml"
+    )
+    shipped_text = Path(shipped_path).read_text()
+
+    with open(shipped_path) as f:
+        loaded = yaml.safe_load(f)
+    values = loaded["/nereo_controller_node"]["ros__parameters"]
+
+    tmp_dir = tempfile.mkdtemp()
+    rewritten_path = os.path.join(tmp_dir, "controller_params.yaml")
+    pid_tuner_gui.write_params_file(rewritten_path, "/nereo_controller_node", values)
+
+    rewritten_text = Path(rewritten_path).read_text()
+    NereoControllerTester._assert_true(
+        rewritten_text == shipped_text,
+        "write_params_file output must be byte-identical to the shipped YAML",
+    )
+
+
+def main() -> int:
+    rclpy.init()
+    tester = NereoControllerTester()
+
+    tests = [
+        ("test_launch_loads_shipped_yaml", lambda: test_launch_loads_shipped_yaml(tester)),
+        (
+            "test_malformed_gains_fail_safe_to_zero",
+            lambda: test_malformed_gains_fail_safe_to_zero(tester),
+        ),
+        ("test_tuner_writer_round_trip", lambda: test_tuner_writer_round_trip(tester)),
+        ("test_writer_rejects_missing_key", lambda: test_writer_rejects_missing_key(tester)),
+        ("test_shipped_yaml_matches_writer", lambda: test_shipped_yaml_matches_writer(tester)),
+    ]
+
+    results: List[TestResult] = []
+    tester.get_logger().info("Starting params-file test suite for nereo_controller_node")
+
+    for test_name, fn in tests:
+        tester.get_logger().info(f"RUN {test_name}")
+        results.append(run_test_case(tester, test_name, fn))
+        tester.spin_for(0.15)
+
+    passed = sum(1 for r in results if r.passed)
+    failed = len(results) - passed
+
+    for r in results:
+        if r.passed:
+            tester.get_logger().info(f"PASS {r.name}")
+        else:
+            tester.get_logger().error(f"FAIL {r.name}: {r.detail}")
+
+    tester.get_logger().info(f"Test summary: {passed}/{len(results)} passed, {failed} failed")
+
+    tester.destroy_node()
+    rclpy.shutdown()
+    return 0 if failed == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
